@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Private LLM Gateway</title>
+    <meta
+      name="description"
+      content="One API for fast, reliable AI models. A single endpoint with automatic fallback, per-key limits, and clear usage tracking. Available by invitation."
+    />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+    <!-- Open Graph / social sharing -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Private LLM Gateway" />
+    <meta
+      property="og:description"
+      content="One API for fast, reliable AI models. Available by invitation."
+    />
+    <meta property="og:image" content="/og-image.svg" />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <!--
+      Theme is applied before first paint to avoid a flash of the wrong theme
+      (STYLE_UPDATE.md §6). Kept inline and tiny on purpose.
+    -->
+    <script>
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('gw-theme')
+          var dark =
+            stored === 'dark' ||
+            (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) document.documentElement.classList.add('dark')
+        } catch (e) {
+          /* private mode: leave the light default */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

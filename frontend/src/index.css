@@ -1,0 +1,424 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===========================================================================
+   Design tokens — STYLE_UPDATE.md §3
+   Warm, calm, editorial. Every colour in the product reads from these tokens;
+   no component may hard-code a hex value.
+
+   Values are RGB channel triplets so Tailwind can apply opacity
+   (e.g. bg-accent/10). The plain-hex aliases below are for SVG attributes
+   and chart props, where var() with channel triplets is unreliable.
+   =========================================================================== */
+
+:root {
+  /* --- surfaces ---------------------------------------------------------- */
+  --bg: 250 249 245;            /* #FAF9F5 warm paper */
+  --surface: 243 241 234;       /* #F3F1EA cards, code card */
+  --surface-raised: 255 255 255;/* #FFFFFF menus, dialogs */
+  --border: 230 226 214;        /* #E6E2D6 */
+  --border-strong: 211 206 191; /* #D3CEBF */
+
+  /* --- text -------------------------------------------------------------- */
+  --fg: 31 30 27;               /* #1F1E1B */
+  --muted: 107 103 94;          /* #6B675E */
+
+  /* --- accent (single source of truth, §3.3) ----------------------------- */
+  --accent: 47 111 94;          /* #2F6F5E deep green */
+  --accent-hover: 38 90 77;     /* #265A4D */
+  --accent-soft: 228 239 234;   /* #E4EFEA tinted backgrounds */
+  --accent-fg: 255 255 255;     /* #FFFFFF text on accent */
+
+  /* --- status ------------------------------------------------------------ */
+  --success: 39 107 68;         /* #276B44 */
+  --warning: 126 86 14;         /* #7E560E */
+  --danger: 158 55 39;          /* #9E3727 */
+
+  /* --- plain hex aliases for SVG / charts -------------------------------- */
+  --c-bg: #faf9f5;
+  --c-surface: #f3f1ea;
+  --c-border: #e6e2d6;
+  --c-muted: #6b675e;
+  --c-accent: #2f6f5e;
+  --c-success: #276b44;
+  --c-danger: #9e3727;
+
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.08);
+
+  /* Categorical chart palette — warm, restrained, derived from the tokens.
+     Kept in one place so no page hard-codes a colour. */
+  --c-chart-1: #2f6f5e;
+  --c-chart-2: #7c9a5e;
+  --c-chart-3: #b08a3e;
+  --c-chart-4: #a5644f;
+  --c-chart-5: #6d7f96;
+  --c-chart-6: #8a7a9b;
+
+  /* Alternative accent presets — uncomment one block to rebrand (§3.3).
+     Never indigo, purple-blue gradients, or an orange near Claude's brand.
+
+  --accent: 60 94 140;          // muted blue  #3C5E8C
+  --accent-hover: 48 76 114;
+  --accent-soft: 231 237 245;
+  --accent-fg: 255 255 255;
+
+  --accent: 122 74 107;         // warm plum   #7A4A6B
+  --accent-hover: 100 60 87;
+  --accent-soft: 243 233 239;
+  --accent-fg: 255 255 255;
+  */
+}
+
+.dark {
+  --bg: 31 30 28;               /* #1F1E1C warm charcoal */
+  --surface: 42 41 39;          /* #2A2927 */
+  --surface-raised: 51 49 46;   /* #33312E */
+  --border: 58 56 52;           /* #3A3834 */
+  --border-strong: 74 71 66;    /* #4A4742 */
+
+  --fg: 239 237 230;            /* #EFEDE6 */
+  --muted: 161 157 146;         /* #A19D92 */
+
+  --accent: 95 179 155;         /* #5FB39B */
+  --accent-hover: 124 200 178;  /* #7CC8B2 */
+  --accent-soft: 38 53 47;      /* #26352F */
+  --accent-fg: 16 32 27;        /* #10201B */
+
+  --success: 108 195 140;       /* #6CC38C */
+  --warning: 224 176 76;        /* #E0B04C */
+  --danger: 232 128 110;        /* #E8806E */
+
+  --c-bg: #1f1e1c;
+  --c-surface: #2a2927;
+  --c-border: #3a3834;
+  --c-muted: #a19d92;
+  --c-accent: #5fb39b;
+  --c-success: #6cc38c;
+  --c-danger: #e8806e;
+
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.4);
+
+  --c-chart-1: #5fb39b;
+  --c-chart-2: #a3c184;
+  --c-chart-3: #dcb264;
+  --c-chart-4: #d9907c;
+  --c-chart-5: #93a5bd;
+  --c-chart-6: #b3a3c4;
+}
+
+/* ---------------------------------------------------------------------------
+   Base
+   --------------------------------------------------------------------------- */
+* {
+  border-color: rgb(var(--border));
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: rgb(var(--bg));
+  color: rgb(var(--fg));
+  font-family: Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Headlines use the serif (§4). Dashboard page titles use it too. */
+h1,
+h2,
+.serif {
+  font-family: Newsreader, 'Source Serif 4', Lora, Georgia, serif;
+  font-weight: 400;
+  letter-spacing: -0.015em;
+}
+
+:focus-visible {
+  outline: 2px solid rgb(var(--accent));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: rgb(var(--accent-soft));
+  color: rgb(var(--fg));
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--border-strong));
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--muted));
+}
+
+/* Short transitions only (§5); disabled for reduced motion. */
+a,
+button,
+input,
+select,
+textarea {
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    opacity 150ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Components (§7)
+   --------------------------------------------------------------------------- */
+@layer components {
+  .card {
+    @apply rounded-2xl border border-border;
+    background: rgb(var(--surface));
+  }
+
+  .card-raised {
+    @apply rounded-2xl border border-border;
+    background: rgb(var(--surface-raised));
+    box-shadow: var(--shadow-menu);
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-4 text-sm font-medium
+           disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap;
+    height: 40px;
+    border-radius: 10px;
+  }
+  .btn-primary {
+    @apply btn;
+    background: rgb(var(--accent));
+    color: rgb(var(--accent-fg));
+    border: 1px solid transparent;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: rgb(var(--accent-hover));
+  }
+  .btn-secondary {
+    @apply btn border;
+    background: transparent;
+    border-color: rgb(var(--border-strong));
+    color: rgb(var(--fg));
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background: rgb(var(--surface));
+  }
+  .btn-ghost {
+    @apply btn;
+    background: transparent;
+    color: rgb(var(--fg));
+    border: 1px solid transparent;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background: rgb(var(--surface));
+  }
+  .btn-danger {
+    @apply btn border;
+    background: transparent;
+    border-color: rgb(var(--danger));
+    color: rgb(var(--danger));
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: rgb(var(--danger) / 0.1);
+  }
+  /* Dashboard buttons are slightly shorter (§7). */
+  .btn-sm {
+    height: 32px;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+    font-size: 0.8125rem;
+  }
+
+  .input,
+  .select {
+    @apply w-full px-3 text-sm focus:outline-none;
+    height: 40px;
+    border-radius: 10px;
+    background: rgb(var(--surface-raised));
+    border: 1px solid rgb(var(--border-strong));
+    color: rgb(var(--fg));
+  }
+  .input::placeholder,
+  .textarea::placeholder {
+    color: rgb(var(--muted));
+  }
+  .input:focus,
+  .select:focus,
+  .textarea:focus {
+    border-color: rgb(var(--accent));
+    box-shadow: 0 0 0 3px rgb(var(--accent) / 0.15);
+  }
+  .textarea {
+    @apply w-full px-3 py-2.5 text-sm focus:outline-none resize-y;
+    border-radius: 10px;
+    background: rgb(var(--surface-raised));
+    border: 1px solid rgb(var(--border-strong));
+    color: rgb(var(--fg));
+  }
+
+  .label {
+    @apply block text-xs font-medium mb-1.5;
+    color: rgb(var(--muted));
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 px-2.5 text-xs font-medium whitespace-nowrap;
+    height: 22px;
+    border-radius: 9999px;
+  }
+  .badge-neutral {
+    @apply badge;
+    background: rgb(var(--border) / 0.6);
+    color: rgb(var(--fg));
+  }
+  .badge-success {
+    @apply badge;
+    background: rgb(var(--success) / 0.14);
+    color: rgb(var(--success));
+  }
+  .badge-warning {
+    @apply badge;
+    background: rgb(var(--warning) / 0.16);
+    color: rgb(var(--warning));
+  }
+  .badge-danger {
+    @apply badge;
+    background: rgb(var(--danger) / 0.14);
+    color: rgb(var(--danger));
+  }
+  .badge-accent {
+    @apply badge;
+    background: rgb(var(--accent-soft));
+    color: rgb(var(--accent));
+  }
+
+  /* Tables: row separators only, sticky header on --surface (§7). */
+  .th {
+    @apply px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide
+           border-b border-border sticky top-0 z-10;
+    color: rgb(var(--muted));
+    background: rgb(var(--surface));
+  }
+  .td {
+    @apply px-3 py-3 border-b border-border align-middle;
+  }
+  .row-hover {
+    @apply cursor-pointer;
+  }
+  .row-hover:hover {
+    background: rgb(var(--accent-soft));
+  }
+
+  .mono {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .page-title {
+    @apply text-2xl;
+    font-family: Newsreader, 'Source Serif 4', Lora, Georgia, serif;
+    font-weight: 400;
+    letter-spacing: -0.02em;
+  }
+  .section-title {
+    @apply text-sm font-semibold;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  /* Public typography scale (§4) */
+  .hero-title {
+    font-family: Newsreader, 'Source Serif 4', Lora, Georgia, serif;
+    font-weight: 400;
+    font-size: 38px;
+    line-height: 1.12;
+    letter-spacing: -0.02em;
+  }
+  @media (min-width: 1024px) {
+    .hero-title {
+      font-size: 56px;
+      line-height: 1.1;
+    }
+  }
+  .section-heading {
+    font-family: Newsreader, 'Source Serif 4', Lora, Georgia, serif;
+    font-weight: 400;
+    font-size: 28px;
+    line-height: 1.2;
+    letter-spacing: -0.015em;
+  }
+  @media (min-width: 1024px) {
+    .section-heading {
+      font-size: 36px;
+    }
+  }
+  .prose-body {
+    font-size: 17px;
+    line-height: 1.6;
+    max-width: 65ch;
+  }
+  .code-bg {
+    background: rgb(var(--surface));
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Code card syntax palette (§7): restrained, built from tokens.
+   --------------------------------------------------------------------------- */
+.tok-key {
+  color: rgb(var(--accent));
+}
+.tok-str {
+  color: rgb(var(--success));
+}
+.tok-num {
+  color: rgb(var(--warning));
+}
+.tok-punc {
+  color: rgb(var(--muted));
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-in {
+  animation: fade-in 150ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-in {
+    animation: none;
+  }
+}

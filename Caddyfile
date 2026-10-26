@@ -1,0 +1,45 @@
+# Replace gw.example.com with your domain; Caddy obtains HTTPS automatically.
+# Set ADMIN_ALLOWED_IPS in .env and/or uncomment the admin IP guard below.
+
+{
+	email you@example.com
+}
+
+gw.example.com {
+	encode zstd gzip
+
+	# --- console: restrict to your IP or a VPN range -----------------------
+	# Uncomment and set your addresses. Everything under /admin and the SPA
+	# itself lives here, so a leaked password is useless to strangers.
+	# @console_admin path /admin/* /login /keys /providers /activity /usage /models /routing /playground /partners /settings /docs
+	# handle @console_admin {
+	# 	@blocked not remote_ip 203.0.113.10/32 100.64.0.0/10
+	# 	respond @blocked 403
+	# 	reverse_proxy gateway-a:8000 gateway-b:8000
+	# }
+
+	# --- metrics: internal only -------------------------------------------
+	@metrics path /metrics
+	respond @metrics 403
+
+	reverse_proxy gateway-a:8000 gateway-b:8000 {
+		# Health-aware load balancing across the two instances.
+		lb_policy least_conn
+		health_uri /readyz
+		health_interval 15s
+
+		# Long provider calls need a generous read timeout.
+		transport http {
+			read_timeout 90s
+			dial_timeout 5s
+		}
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+		format json
+	}
+}

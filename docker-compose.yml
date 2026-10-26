@@ -1,0 +1,83 @@
+name: gateway
+
+# Two identical, stateless gateway instances behind Caddy (brief §3).
+# No local files matter: PostgreSQL holds data, Redis holds shared counters.
+
+x-app: &app
+  build: .
+  image: private-llm-gateway:latest
+  env_file: .env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway}
+      POSTGRES_DB: gateway
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # Persist so counters and breaker state survive a restart.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  gateway-a:
+    <<: *app
+    environment:
+      INSTANCE: a
+    expose:
+      - "8000"
+
+  gateway-b:
+    <<: *app
+    environment:
+      INSTANCE: b
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - gateway-a
+      - gateway-b
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  caddydata:
+  caddyconfig:

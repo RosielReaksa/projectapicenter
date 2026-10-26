@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Gateway logo">
+  <!-- Original placeholder mark: a rounded square with a letter G.
+       Replace this file and the config entry to rebrand (§8). -->
+  <rect width="32" height="32" rx="8" fill="#2F6F5E" />
+  <path
+    d="M21 12.2a5.2 5.2 0 1 0 1.1 5.4h-4.2v-2.3h6.4v1.1a7.6 7.6 0 1 1-2.1-5.2z"
+    fill="#FFFFFF"
+  />
+</svg>

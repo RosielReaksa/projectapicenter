@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Import check
+        run: python tools/import_check.py
+
+      - name: Unit and integration tests (SQLite)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest tests -q
+
+      - name: Migrations apply and roll back
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DATABASE_URL: postgresql+asyncpg://gateway:gateway@localhost:5432/gateway_test
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Tests against PostgreSQL + Redis
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DATABASE_URL: postgresql+asyncpg://gateway:gateway@localhost:5432/gateway_test
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests -q
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+      - name: Build console
+        working-directory: frontend
+        run: npm run build

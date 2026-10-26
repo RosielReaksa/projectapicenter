@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-label="Private LLM Gateway">
+  <!-- Social share placeholder. Replace with a designed asset before launch. -->
+  <rect width="1200" height="630" fill="#FAF9F5" />
+  <rect x="80" y="80" width="72" height="72" rx="18" fill="#2F6F5E" />
+  <path
+    d="M131 116a11.7 11.7 0 1 0 2.5 12.2h-9.5v-5.2h14.4v2.5a17.1 17.1 0 1 1-4.7-11.7z"
+    fill="#FFFFFF"
+    transform="translate(-4 -4)"
+  />
+  <text x="80" y="330" font-family="Georgia, serif" font-size="68" fill="#1F1E1B">
+    One API for fast,
+  </text>
+  <text x="80" y="410" font-family="Georgia, serif" font-size="68" fill="#1F1E1B">
+    reliable AI models.
+  </text>
+  <text x="80" y="490" font-family="Helvetica, Arial, sans-serif" font-size="26" fill="#6B675E">
+    Automatic fallback, per-key limits, clear usage. Available by invitation.
+  </text>
+</svg>
