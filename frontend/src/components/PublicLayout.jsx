@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '../lib/auth'
 import { usePublicTheme, useSite } from '../lib/site'
+import { api } from '../lib/api'
 import { CopyButton } from '../components/ui'
 
 const LINKS = [
@@ -14,7 +15,27 @@ export default function PublicLayout() {
   const { user } = useAuth()
   const [theme, toggleTheme] = usePublicTheme()
   const [menuOpen, setMenuOpen] = useState(false)
+  const [status, setStatus] = useState(null)
   const location = useLocation()
+
+  // Public maintenance state drives the banner (MAINTENANCE_SPEC §9).
+  useEffect(() => {
+    let alive = true
+    const load = () => {
+      api
+        .get('/public/status')
+        .then((data) => {
+          if (alive) setStatus(data)
+        })
+        .catch(() => {})
+    }
+    load()
+    const timer = window.setInterval(load, 30000)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [])
 
   useEffect(() => {
     setMenuOpen(false)
@@ -131,6 +152,8 @@ export default function PublicLayout() {
         </div>
       </header>
 
+      <MaintenanceBanner status={status} />
+
       <main className="flex-1">
         <Outlet />
       </main>
@@ -209,4 +232,45 @@ export function CodeBlock({ code, language = 'bash', showCopy = true }) {
       </pre>
     </div>
   )
+}
+
+
+/** Red bar during maintenance, amber for a scheduled window (§9, §6). */
+function MaintenanceBanner({ status }) {
+  if (!status) return null
+
+  if (status.state === "maintenance") {
+    return (
+      <div className="border-b border-danger/40 bg-danger/10">
+        <div className="mx-auto w-full max-w-content px-6 py-2.5 text-sm flex flex-wrap items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-danger shrink-0" aria-hidden="true" />
+          <span className="font-medium">
+            {status.message || "The API is temporarily paused for maintenance."}
+          </span>
+          {status.expected_end && (
+            <span className="text-muted">
+              Expected back {new Date(status.expected_end).toLocaleString()}.
+            </span>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  if (status.upcoming_window) {
+    const { starts_at, ends_at, banner_text } = status.upcoming_window
+    return (
+      <div className="border-b border-warning/40 bg-warning/10">
+        <div className="mx-auto w-full max-w-content px-6 py-2.5 text-sm flex flex-wrap items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-warning shrink-0" aria-hidden="true" />
+          <span>
+            Scheduled maintenance: {new Date(starts_at).toLocaleString()} to{" "}
+            {new Date(ends_at).toLocaleString()}. {banner_text}
+          </span>
+        </div>
+      </div>
+    )
+  }
+
+  return null
 }

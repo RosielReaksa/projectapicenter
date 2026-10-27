@@ -6,12 +6,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-
 from app.core import health, limits, settings_store
-from app.models import GatewayKey, Model, Partner, Provider, RoutingRule
+from app.core.config_cache import ModelSnapshot, ProviderSnapshot
 
 
 class NoCandidate(Exception):
@@ -22,8 +18,8 @@ class NoCandidate(Exception):
 
 @dataclass(slots=True)
 class Candidate:
-    model: Model
-    provider: Provider
+    model: ModelSnapshot
+    provider: ProviderSnapshot
     reason: str = ""
 
     @property
@@ -119,13 +115,13 @@ def _apply_action(candidates: list[Candidate], action: dict[str, Any]) -> list[C
 
 
 # -------------------------------------------------------------- selection
-def _allowed_names(key: GatewayKey) -> set[str]:
-    if not key.allowed_models:
+def _allowed_names(key: Any) -> set[str]:
+    if key is None or not getattr(key, "allowed_models", None):
         return set()
     try:
         values = json.loads(key.allowed_models)
         return {str(v) for v in values} if isinstance(values, list) else set()
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         return set()
 
 
@@ -139,7 +135,7 @@ def _order_key(candidate: Candidate) -> tuple:
     )
 
 
-def _free_tier_allowed(partner: Partner | None, key: GatewayKey | None) -> bool:
+def _free_tier_allowed(partner: Any | None, key: Any | None) -> bool:
     """Free tiers are opt-in: the key may override the partner, else default off."""
     if key is not None and key.allow_free_tier is not None:
         return key.allow_free_tier
@@ -148,29 +144,59 @@ def _free_tier_allowed(partner: Partner | None, key: GatewayKey | None) -> bool:
     return False
 
 
-async def _catalog(session: AsyncSession) -> list[Candidate]:
-    rows = (
-        await session.execute(
-            select(Model)
-            .join(Provider, Model.provider_id == Provider.id)
-            .options(selectinload(Model.provider))
-            .where(Model.is_enabled.is_(True), Provider.is_active.is_(True))
-        )
-    ).scalars().all()
-    # A provider without a key cannot serve anything.
-    return [Candidate(model=m, provider=m.provider) for m in rows if m.provider.api_key_enc]
+async def _catalog():
+    """The cached catalog, loaded once on a short session when cold."""
+    from app.core import config_cache
+
+    catalog = config_cache.cached_catalog()
+    if catalog is None:
+        from app.db import SessionLocal
+
+        async with SessionLocal() as session:
+            catalog = await config_cache.get_catalog(session)
+    return catalog
+
+
+def spend_caps(candidates: list[Candidate]) -> dict:
+    """What spend checks this candidate set needs, without touching the database.
+
+    Separated so the data plane can batch every spend query for one request into
+    a single short session instead of opening one per check.
+    """
+    global_cap = float(settings_store.get("global_monthly_cap_usd", 0) or 0)
+    return {
+        "global_cap": global_cap,
+        "needs_global": bool(global_cap) and any(not c.is_free for c in candidates),
+        "provider_caps": {
+            c.provider.id: c.provider.monthly_cap_usd
+            for c in candidates
+            if c.provider.monthly_cap_usd is not None
+        },
+    }
 
 
 async def pick_candidates(
-    session: AsyncSession,
     requested_model: str,
-    key: GatewayKey | None,
+    key: Any | None,
     features: RequestFeatures,
     *,
-    partner: Partner | None = None,
+    partner: Any | None = None,
     allow_free_tier: bool | None = None,
 ) -> list[Candidate]:
-    catalog = await _catalog(session)
+    """Pick an ordered candidate list.
+
+    Reads the cached catalog and the shared store only; it opens a short
+    session of its own when a spend aggregate is needed, and never borrows the
+    caller's session (LOAD_FIX: no connection across the provider call).
+    """
+    catalog_obj = await _catalog()
+    # A provider without a key cannot serve anything; paused providers are
+    # already excluded when the catalog is built.
+    catalog = [
+        Candidate(model=m, provider=m.provider)
+        for m in catalog_obj.models
+        if m.provider.api_key_enc and not m.provider.paused
+    ]
     if not catalog:
         raise NoCandidate(
             "No providers are configured yet. Add a provider key in the dashboard first."
@@ -209,6 +235,20 @@ async def pick_candidates(
                 "this partner. Enable them on the partner or add a paid provider."
             )
 
+    # ---- degraded mode restrictions --------------------------------------
+    from app.core import maintenance as maint
+
+    degraded = (await maint.get_state()).degraded
+    if degraded.active:
+        if degraded.paid_only:
+            catalog = [c for c in catalog if not c.is_free]
+        if degraded.free_only:
+            catalog = [c for c in catalog if c.is_free]
+        if not catalog:
+            raise NoCandidate(
+                "The service is running in a restricted mode and no model matches it. Try again later."
+            )
+
     # ---- requested model ------------------------------------------------
     requested = (requested_model or "auto").strip()
     if requested and requested != "auto":
@@ -232,14 +272,7 @@ async def pick_candidates(
             candidates = preferred + [c for c in candidates if c not in preferred]
 
     # ---- rules ----------------------------------------------------------
-    rules = (
-        await session.execute(
-            select(RoutingRule)
-            .where(RoutingRule.is_active.is_(True))
-            .order_by(RoutingRule.position, RoutingRule.id)
-        )
-    ).scalars().all()
-    for rule in rules:
+    for rule in catalog_obj.rules:
         try:
             condition = json.loads(rule.condition_json or "{}")
             action = json.loads(rule.action_json or "{}")
@@ -268,9 +301,19 @@ async def pick_candidates(
         raise NoCandidate("All providers are cooling down after failures. Try again shortly.")
     candidates = healthy
 
-    # ---- global spend kill switch ---------------------------------------
-    cap = float(settings_store.get("global_monthly_cap_usd", 0) or 0)
-    if await limits.paid_routes_blocked(session, cap):
+    # ---- spend caps ------------------------------------------------------
+    # The only database reads left in routing. Each cached helper opens and
+    # closes its own short session, so a request waiting on the single-flight
+    # lock never holds a connection while it waits.
+    caps = spend_caps(candidates)
+    global_blocked = False
+    spend: dict[int, float] = {}
+    if caps["needs_global"]:
+        global_blocked = await limits.cached_global_spend() >= caps["global_cap"]
+    for pid in caps["provider_caps"]:
+        spend[pid] = await limits.cached_provider_spend(pid)
+
+    if global_blocked:
         candidates = [c for c in candidates if c.is_free]
         if not candidates:
             raise NoCandidate(
@@ -278,19 +321,13 @@ async def pick_candidates(
                 "and none are available."
             )
 
-    # ---- provider monthly caps -------------------------------------------
-    spend: dict[int, float] = {}
-    filtered: list[Candidate] = []
-    for candidate in candidates:
-        provider_cap = candidate.provider.monthly_cap_usd
-        if provider_cap is not None:
-            pid = candidate.provider.id
-            if pid not in spend:
-                spend[pid] = await limits.provider_spend(session, pid)
-            if spend[pid] >= provider_cap:
-                continue
-        filtered.append(candidate)
-    candidates = filtered
+    provider_caps = caps["provider_caps"]
+    candidates = [
+        c
+        for c in candidates
+        if c.provider.id not in provider_caps
+        or spend.get(c.provider.id, 0.0) < provider_caps[c.provider.id]
+    ]
 
     if not candidates:
         raise NoCandidate("No provider is currently able to serve this request.")

@@ -1,0 +1,234 @@
+{
+  "machine": {
+    "os": "Windows 11",
+    "python": "3.12.7"
+  },
+  "database": {
+    "url_scheme": "sqlite",
+    "database_url": "sqlite+aiosqlite:///D:/projectradom/projectapicenter/data/loadtest.db",
+    "pool": {
+      "pool_class": "InstrumentedPool",
+      "size": 5,
+      "checkedin": 1,
+      "checkedout": 1,
+      "max_overflow": 10,
+      "overflow": 0,
+      "capacity": 15
+    },
+    "pool_timeout_s": 3.0,
+    "shared_state": "memory"
+  },
+  "provider_latency_s": 2.0,
+  "scenarios": {
+    "concurrency_20": {
+      "total_requests": 527,
+      "requests_per_second": 8.4,
+      "error_rate_pct": 0.0,
+      "unexpected_error_rate_pct": 0.0,
+      "status_counts": {
+        "200": 527
+      },
+      "latency_ms": {
+        "p50": 2136.1,
+        "p95": 2955.4,
+        "p99": 3134.9,
+        "max": 3430.6
+      },
+      "latency_ms_200_only": {
+        "p50": 2136.1,
+        "p95": 2955.4,
+        "errors": 0,
+        "n": 527
+      },
+      "concurrency": 20,
+      "duration_s": 62.8,
+      "peak_db_connections_checked_out": 13,
+      "client_side_exceptions": {},
+      "capacity_after": {
+        "pool": {
+          "pool_class": "InstrumentedPool",
+          "size": 5,
+          "checkedin": 4,
+          "checkedout": 1,
+          "max_overflow": 10,
+          "overflow": 0,
+          "capacity": 15
+        },
+        "in_flight": {
+          "in_flight": 0,
+          "peak": 20,
+          "cap": 100,
+          "shed_total": 0,
+          "pool_saturated": false
+        },
+        "config_cache": {
+          "cached_keys": 0,
+          "catalog_loaded": 1
+        },
+        "db_pool_timeout_seconds": 3.0
+      },
+      "db_pool_wait_seconds": {
+        "count": 600.0,
+        "sum": 13.40807250004218,
+        "shed_total": 0.0,
+        "mean_ms": 22.347
+      }
+    },
+    "concurrency_50": {
+      "total_requests": 1346,
+      "requests_per_second": 21.4,
+      "error_rate_pct": 0.0,
+      "unexpected_error_rate_pct": 0.0,
+      "status_counts": {
+        "200": 1346
+      },
+      "latency_ms": {
+        "p50": 2108.6,
+        "p95": 3252.1,
+        "p99": 4096.4,
+        "max": 4207.7
+      },
+      "latency_ms_200_only": {
+        "p50": 2108.6,
+        "p95": 3252.1,
+        "errors": 0,
+        "n": 1346
+      },
+      "concurrency": 50,
+      "duration_s": 62.8,
+      "peak_db_connections_checked_out": 15,
+      "client_side_exceptions": {},
+      "capacity_after": {
+        "pool": {
+          "pool_class": "InstrumentedPool",
+          "size": 5,
+          "checkedin": 4,
+          "checkedout": 1,
+          "max_overflow": 10,
+          "overflow": 0,
+          "capacity": 15
+        },
+        "in_flight": {
+          "in_flight": 0,
+          "peak": 50,
+          "cap": 100,
+          "shed_total": 0,
+          "pool_saturated": false
+        },
+        "config_cache": {
+          "cached_keys": 0,
+          "catalog_loaded": 1
+        },
+        "db_pool_timeout_seconds": 3.0
+      },
+      "db_pool_wait_seconds": {
+        "count": 1530.0,
+        "sum": 46.46619409996856,
+        "shed_total": 0.0,
+        "mean_ms": 30.37
+      }
+    },
+    "concurrency_200": {
+      "total_requests": 1290,
+      "requests_per_second": 18.1,
+      "error_rate_pct": 31.71,
+      "unexpected_error_rate_pct": 0.0,
+      "status_counts": {
+        "429": 409,
+        "200": 881
+      },
+      "latency_ms": {
+        "p50": 9480.1,
+        "p95": 21059.4,
+        "p99": 31447.0,
+        "max": 43205.6
+      },
+      "latency_ms_200_only": {
+        "p50": 10760.0,
+        "p95": 22236.8,
+        "errors": 409,
+        "n": 1290
+      },
+      "concurrency": 200,
+      "duration_s": 71.2,
+      "peak_db_connections_checked_out": 15,
+      "client_side_exceptions": {},
+      "capacity_after": {
+        "pool": {
+          "pool_class": "InstrumentedPool",
+          "size": 5,
+          "checkedin": 4,
+          "checkedout": 1,
+          "max_overflow": 10,
+          "overflow": 0,
+          "capacity": 15
+        },
+        "in_flight": {
+          "in_flight": 0,
+          "peak": 100,
+          "cap": 100,
+          "shed_total": 409,
+          "pool_saturated": false
+        },
+        "config_cache": {
+          "cached_keys": 0,
+          "catalog_loaded": 1
+        },
+        "db_pool_timeout_seconds": 3.0
+      },
+      "db_pool_wait_seconds": {
+        "count": 2529.0,
+        "sum": 452.7800086999996,
+        "shed_total": 409.0,
+        "mean_ms": 179.035
+      }
+    },
+    "noisy_neighbour": {
+      "concurrency_a": 20,
+      "duration_s": 124.0,
+      "b_baseline": {
+        "p50": 2065.5,
+        "p95": 2097.4,
+        "errors": 0,
+        "n": 27
+      },
+      "b_during_burst": {
+        "p50": 2030.4,
+        "p95": 2079.3,
+        "errors": 0,
+        "n": 27
+      },
+      "p50_delta_ms": -35.09999999999991,
+      "p50_delta_pct": -1.7
+    }
+  },
+  "capacity_config": {
+    "pool": {
+      "pool_class": "InstrumentedPool",
+      "size": 5,
+      "checkedin": 1,
+      "checkedout": 1,
+      "max_overflow": 10,
+      "overflow": 0,
+      "capacity": 15
+    },
+    "in_flight": {
+      "in_flight": 0,
+      "peak": 0,
+      "cap": 100,
+      "shed_total": 0,
+      "pool_saturated": false
+    },
+    "config_cache": {
+      "cached_keys": 0,
+      "catalog_loaded": 0
+    },
+    "db_pool_timeout_seconds": 3.0
+  },
+  "max_in_flight": 100,
+  "memory_mb": {
+    "before": 4.1,
+    "after": 4.2,
+    "growth": 0.1
+  }
+}

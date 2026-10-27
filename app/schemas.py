@@ -233,3 +233,49 @@ class AccessRequestCreate(BaseModel):
 
 class AccessRequestReject(BaseModel):
     notes: str | None = Field(default=None, max_length=1000)
+
+
+# ------------------------------------------------------------- maintenance
+class MaintenanceStartRequest(BaseModel):
+    message: str = Field(default="", max_length=300)
+    expected_end: str | None = None
+    allow_ips: list[str] = []
+    allow_current_ip: bool = True
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class MaintenanceStopRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class DegradedRequest(BaseModel):
+    active: bool
+    paid_only: bool = False
+    free_only: bool = False
+    reduce_concurrency_pct: int = Field(default=0, ge=0, le=100)
+    max_tokens: int | None = Field(default=None, ge=1)
+    reject_low_priority: bool = False
+    message: str = Field(default="", max_length=300)
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class ProviderPauseRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class PartnerSuspendRequest(BaseModel):
+    reason_internal: str = Field(min_length=1, max_length=1000)
+    reason_public: str | None = Field(default=None, max_length=300)
+
+
+class WindowCreateRequest(BaseModel):
+    starts_at: str
+    ends_at: str
+    banner_text: str = Field(min_length=1, max_length=300)
+    auto_enable: bool = False
+
+
+class WindowUpdateRequest(BaseModel):
+    ends_at: str | None = None
+    banner_text: str | None = Field(default=None, max_length=300)
+    auto_enable: bool | None = None

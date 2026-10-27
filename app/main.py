@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__, jobs
 from app.api import (
     admin_access,
+    admin_maintenance,
     admin_activity,
     admin_auth,
     admin_keys,
@@ -29,7 +30,7 @@ from app.api import (
 )
 from app.bootstrap import bootstrap
 from app.config import BASE_DIR, settings
-from app.core import settings_store
+from app.core import config_cache, limits, overload, settings_store
 from app.core.store import build_store, close_store
 from app.db import SessionLocal, dispose_db, init_db
 from app.errors import error_response, install_error_handlers
@@ -67,6 +68,11 @@ async def lifespan(app: FastAPI):
     )
     app.state.http = app_http
 
+    # Restore maintenance state into Redis before serving any request.
+    from app.core.maintenance import restore_redis_on_startup
+
+    await restore_redis_on_startup()
+
     jobs.start()
     log.info(
         "gateway ready version=%s env=%s shared_state=%s",
@@ -78,8 +84,15 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Graceful shutdown: stop accepting, let in-flight work finish, then close.
+        # Graceful shutdown: stop accepting, let in-flight work finish, then
+        # flush any queued request logs before closing the pool.
         jobs.stop()
+        try:
+            from app.core.execute import drain_log_queue
+
+            await drain_log_queue()
+        except Exception:  # pragma: no cover - shutdown only
+            log.warning("Could not drain the request-log queue at shutdown")
         await app_http.aclose()
         app_http = None
         await close_store()
@@ -120,7 +133,41 @@ async def request_context(request: Request, call_next):
             413, "payload_too_large", f"Request body exceeds {limit} bytes.", request.state.request_id
         )
 
-    response = await call_next(request)
+    # Overload shedding (LOAD_FIX requirement 4). This runs before routing,
+    # auth and any database work, so an instance at capacity refuses in
+    # microseconds instead of queueing behind a connection checkout.
+    shed_slot = request.url.path.startswith("/v1")
+    if shed_slot:
+        try:
+            await overload.acquire()
+        except overload.Overloaded as exc:
+            return error_response(
+                exc.status,
+                exc.code,
+                exc.message,
+                request.state.request_id,
+                {"Retry-After": str(exc.retry_after)},
+            )
+
+    try:
+        response = await call_next(request)
+    finally:
+        if shed_slot:
+            await overload.release()
+
+    # A successful control-plane write invalidates the hot-path config cache, so a
+    # disabled key or deactivated partner takes effect on the next data-plane
+    # request served by THIS instance. Other instances keep their own cache until
+    # it expires (KEY_CACHE_TTL 2s, CONFIG_CACHE_TTL 10s): invalidating across a
+    # cluster would need pub/sub or a shared version row.
+    if (
+        request.method not in SAFE_METHODS
+        and request.url.path.startswith("/admin")
+        and response.status_code < 400
+    ):
+        config_cache.bump()
+        limits.invalidate_spend()
+
     response.headers["X-Request-Id"] = request.state.request_id
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -172,6 +219,9 @@ app.include_router(public.router)
 app.include_router(v1_chat.router)
 app.include_router(admin_auth.router)
 app.include_router(admin_access.router)
+app.include_router(admin_maintenance.router)
+app.include_router(admin_maintenance.providers_router)
+app.include_router(admin_maintenance.partners_router)
 app.include_router(admin_partners.router)
 app.include_router(admin_keys.router)
 app.include_router(admin_providers.router)

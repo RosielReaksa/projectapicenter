@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import client_ip, current_user, owner_user
 from app.core import audit, cache as response_cache, settings_store
+from app.core.config_cache import key_snapshot, partner_snapshot
 from app.core.router import NoCandidate, extract_features, pick_candidates
 from app.db import get_session
 from app.errors import error_response
@@ -176,9 +177,16 @@ async def preview_route(
         )
     ).scalars().first() if partner else None
 
+    # pick_candidates works from detached snapshots and opens its own short
+    # session for spend aggregates (LOAD_FIX: no shared request session).
+    key_snap = key_snapshot(key, partner) if key is not None else None
+    partner_snap = key_snap.partner if key_snap is not None else (
+        partner_snapshot(partner) if partner is not None else None
+    )
+
     try:
         candidates = await pick_candidates(
-            session, requested_model, key, features, partner=partner, allow_free_tier=True
+            requested_model, key_snap, features, partner=partner_snap, allow_free_tier=True
         )
     except NoCandidate as exc:
         return {"candidates": [], "error": exc.message}

@@ -5,14 +5,15 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import client_ip, current_user, owner_user
 from app.config import settings
-from app.core import audit, cache as response_cache, health, settings_store
+from app.core import audit, cache as response_cache, config_cache, health, settings_store
 from app.core.auth import generate_gateway_key, gateway_key_prefix, hash_password, hash_gateway_key
+from app.core.config_cache import KeySnapshot
 from app.core.execute import ChatError, execute_chat
 from app.db import get_session
 from app.errors import error_response
@@ -23,12 +24,42 @@ from app.utils import iso, utcnow
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+async def _playground_key(session: AsyncSession, partner: Partner) -> KeySnapshot:
+    """The key the playground spends against, as a detached snapshot.
+
+    Reuses the partner's first active key, or creates an internal one so that
+    limits, logging and cost all behave exactly as they do for /v1 traffic.
+    """
+    key = (
+        await session.execute(
+            select(GatewayKey)
+            .where(GatewayKey.partner_id == partner.id, GatewayKey.is_active.is_(True))
+            .order_by(GatewayKey.created_at)
+        )
+    ).scalars().first()
+
+    if key is None:
+        raw = generate_gateway_key()
+        key = GatewayKey(
+            partner_id=partner.id,
+            name="Playground (auto)",
+            key_hash=hash_gateway_key(raw),
+            key_prefix=gateway_key_prefix(raw),
+            is_active=True,
+            created_at=utcnow(),
+        )
+        session.add(key)
+        await session.commit()
+        await session.refresh(key)
+
+    return config_cache.key_snapshot(key, partner)
+
+
 # --------------------------------------------------------------- playground
 @router.post("/playground/run")
 async def playground_run(
     payload: PlaygroundRequest,
     request: Request,
-    background: BackgroundTasks,
     user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ):
@@ -47,28 +78,9 @@ async def playground_run(
             400, "invalid_request", "Create a partner first, then add a provider key.", ""
         )
 
-    key = (
-        await session.execute(
-            select(GatewayKey)
-            .where(GatewayKey.partner_id == partner.id, GatewayKey.is_active.is_(True))
-            .order_by(GatewayKey.created_at)
-        )
-    ).scalars().first()
-
-    # Playground runs get an internal key so limits, logging and cost all work.
-    if not key:
-        raw = generate_gateway_key()
-        key = GatewayKey(
-            partner_id=partner.id,
-            name="Playground (auto)",
-            key_hash=hash_gateway_key(raw),
-            key_prefix=gateway_key_prefix(raw),
-            is_active=True,
-            created_at=utcnow(),
-        )
-        session.add(key)
-        await session.commit()
-        await session.refresh(key)
+    # The playground is a control-plane call, so its own request session is
+    # fine here; it is released before execute_chat opens its short sessions.
+    key_snapshot = await _playground_key(session, partner)
 
     messages = list(payload.messages)
     if payload.system:
@@ -88,13 +100,11 @@ async def playground_run(
 
     try:
         outcome = await execute_chat(
-            session,
-            key=key,
+            key=key_snapshot,
             partner=partner,
             body=body,
             client=request.app.state.http,
             source="playground",
-            background=background,
         )
     except ChatError as exc:
         return error_response(

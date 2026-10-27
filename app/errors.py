@@ -7,9 +7,11 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.deps import AuthFailure
+from app.api.deps import AuthFailure, MaintenanceActive
+from app.config import settings
 from app.core.execute import ChatError
 from app.utils import new_request_id
 
@@ -50,6 +52,25 @@ def error_response(
 
 
 def install_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(MaintenanceActive)
+    async def _maintenance(request: Request, exc: MaintenanceActive):
+        request_id = getattr(request.state, "request_id", "") or new_request_id()
+        error = {
+            "code": "maintenance",
+            "message": exc.message,
+            "request_id": request_id,
+        }
+        if exc.expected_end:
+            error["expected_end"] = exc.expected_end.isoformat() + "Z"
+        return JSONResponse(
+            status_code=503,
+            content={"error": error},
+            headers={
+                "X-Request-Id": request_id,
+                "Retry-After": str(exc.retry_after),
+            },
+        )
+
     @app.exception_handler(AuthFailure)
     async def _auth_failure(request: Request, exc: AuthFailure):
         request_id = getattr(request.state, "request_id", "") or new_request_id()
@@ -88,5 +109,30 @@ def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
         request_id = getattr(request.state, "request_id", "") or new_request_id()
+
+        # A pool checkout timeout means something is holding connections across
+        # a slow call. It must fail fast and loudly rather than appear as a
+        # generic 500 (LOAD_FIX requirement 5).
+        if isinstance(exc, SQLAlchemyTimeoutError):
+            from app.core import metrics
+            from app.db import pool_stats
+
+            stats = pool_stats()
+            metrics.refresh_pool_gauges()
+            log.error(
+                "DB pool checkout timed out [%s]: %.0fs wait, pool=%s. "
+                "A connection is being held across a slow call.",
+                request_id,
+                settings.db_pool_timeout,
+                stats,
+            )
+            return error_response(
+                503,
+                "database_busy",
+                "The gateway is busy. Please retry shortly.",
+                request_id,
+                {"Retry-After": "1"},
+            )
+
         log.exception("Unhandled error [%s]", request_id)
         return error_response(500, "internal_error", "Unexpected server error.", request_id)

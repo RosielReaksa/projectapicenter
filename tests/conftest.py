@@ -135,6 +135,7 @@ def provider_id(admin_client, fake_provider_url):
         "empty-model",
         "no-usage-model",
         "auth-model",
+        "slow2-model",
     ):
         admin_client.post(
             "/admin/models",

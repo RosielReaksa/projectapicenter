@@ -2,24 +2,20 @@
 
 from __future__ import annotations
 
-import json
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.api.deps import require_gateway_key
 from app.config import settings
-from app.core import limits
+from app.core import config_cache, limits
 from app.core.auth import KeyContext
 from app.core.execute import ChatError, execute_chat
 from app.core.store import get_store
 from app.db import get_session
 from app.errors import error_response
-from app.models import Model, Provider
 from app.schemas import ChatRequest
 from app.utils import iso
 
@@ -39,10 +35,14 @@ def _idempotency_key(request: Request, context: KeyContext) -> str | None:
 async def chat_completions(
     payload: ChatRequest,
     request: Request,
-    background: BackgroundTasks,
     context: KeyContext = Depends(require_gateway_key),
-    session: AsyncSession = Depends(get_session),
 ):
+    """Run one completion.
+
+    There is deliberately no request-scoped DB session here: auth, pre-flight
+    and logging each open a short session of their own, so nothing holds a
+    connection while the provider is being called (LOAD_FIX).
+    """
     body = payload.model_dump(exclude_none=True)
     # Forward any other OpenAI-compatible fields untouched.
     body.update(payload.model_extra or {})
@@ -59,6 +59,18 @@ async def chat_completions(
     if end_user:
         end_user = end_user.strip()[:255]
 
+    # The in-flight slot for this request was taken by the overload middleware,
+    # which runs before auth, so there is nothing to acquire here.
+    return await _handle(payload, request, context, body, end_user)
+
+
+async def _handle(
+    payload: ChatRequest,
+    request: Request,
+    context: KeyContext,
+    body: dict,
+    end_user: str | None,
+):
     # ---- idempotency (brief §4.9) ------------------------------------
     store = get_store()
     idem = _idempotency_key(request, context)
@@ -86,14 +98,12 @@ async def chat_completions(
 
     try:
         result = await execute_chat(
-            session,
             key=context.key,
             partner=context.partner,
             body=body,
             client=request.app.state.http,
             source="api",
             end_user=end_user,
-            background=background,
         )
     except ChatError as exc:
         if idem:
@@ -107,6 +117,12 @@ async def chat_completions(
                 },
                 settings.idempotency_ttl_seconds,
             )
+        raise
+    except BaseException:
+        # Any other failure (cancellation, a bug) must not leave the key locked
+        # for the full 24h TTL, which would 409 every retry for a day.
+        if idem:
+            await store.idem_release(idem)
         raise
 
     if idem:
@@ -131,22 +147,10 @@ async def list_models(
     context: KeyContext = Depends(require_gateway_key),
     session: AsyncSession = Depends(get_session),
 ):
-    rows = (
-        await session.execute(
-            select(Model)
-            .join(Provider, Model.provider_id == Provider.id)
-            .options(selectinload(Model.provider))
-            .where(Model.is_enabled.is_(True), Provider.is_active.is_(True))
-            .order_by(Provider.priority, Model.model_name)
-        )
-    ).scalars().all()
+    """Model list for a key. Cold paths only, so the request session is fine."""
+    catalog = await config_cache.get_catalog(session)
 
-    allowed: set[str] = set()
-    if context.key.allowed_models:
-        try:
-            allowed = {str(v) for v in json.loads(context.key.allowed_models)}
-        except json.JSONDecodeError:
-            allowed = set()
+    allowed = set(config_cache.allowed_list(context.key.allowed_models))
 
     free_ok = (
         context.key.allow_free_tier
@@ -155,7 +159,7 @@ async def list_models(
     )
 
     data = []
-    for model in rows:
+    for model in catalog.models:
         if not free_ok and model.provider.is_free_tier:
             continue
         if allowed and model.public_name not in allowed and model.model_name not in allowed:
@@ -194,6 +198,7 @@ async def key_usage(
     context: KeyContext = Depends(require_gateway_key),
     session: AsyncSession = Depends(get_session),
 ):
+    """Caller-facing usage. Read-only aggregates, so the request session is fine."""
     usage = await limits.key_usage(session, context.key.id)
     partner_usage = await limits.partner_usage(session, context.partner.id)
     return {

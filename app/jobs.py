@@ -7,13 +7,14 @@ from datetime import timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import delete, select
+from sqlalchemy.orm import selectinload
 
 from app.core import cache as response_cache
 from app.core import settings_store
 from app.core.crypto import decrypt
 from app.core.health import record_failure, record_success
 from app.db import SessionLocal
-from app.models import DailySummary, Provider, RequestLog
+from app.models import DailySummary, MaintenanceHistory, MaintenanceWindow, Provider, RequestLog
 from app.providers import openai_compat
 from app.utils import utcnow
 
@@ -117,8 +118,14 @@ async def probe_providers() -> None:
         return
 
     async with SessionLocal() as session:
+        # selectinload: without it, reading provider.models below happens outside
+        # a greenlet and raises MissingGreenlet, which killed this job silently.
         providers = (
-            await session.execute(select(Provider).where(Provider.is_active.is_(True)))
+            await session.execute(
+                select(Provider)
+                .options(selectinload(Provider.models))
+                .where(Provider.is_active.is_(True))
+            )
         ).scalars().all()
 
         for provider in providers:
@@ -156,6 +163,12 @@ def start() -> None:
     scheduler.add_job(cleanup_cache, "interval", minutes=30, id="cache_cleanup")
     scheduler.add_job(aggregate_and_prune, "cron", hour=3, minute=30, id="retention")
     scheduler.add_job(probe_providers, "interval", minutes=5, id="health_probe")
+    scheduler.add_job(
+        run_maintenance_windows, "interval", seconds=30, id="maintenance_windows"
+    )
+    scheduler.add_job(
+        reload_maintenance_state, "interval", seconds=30, id="maintenance_reload"
+    )
     scheduler.start()
     log.info("Background jobs scheduled.")
 
@@ -165,3 +178,83 @@ def stop() -> None:
     if scheduler is not None:
         scheduler.shutdown(wait=False)
         scheduler = None
+
+
+# ------------------------------------------------- scheduled maintenance (§6)
+async def run_maintenance_windows() -> None:
+    """Start and end scheduled windows. Only one instance runs this at a time."""
+    from app.core import maintenance
+    from app.core.store import get_store
+
+    store = get_store()
+    # Redis lock so a cluster runs the scheduler exactly once (§6, §11).
+    acquired = await store.idem_begin("maintenance-scheduler", 55)
+    if not acquired:
+        return
+
+    async with SessionLocal() as session:
+        now = utcnow()
+        windows = (
+            await session.execute(
+                select(MaintenanceWindow).where(
+                    MaintenanceWindow.status.in_(["scheduled", "active"])
+                )
+            )
+        ).scalars().all()
+
+        for window in windows:
+            if window.status == "scheduled" and window.auto_enable and window.starts_at <= now < window.ends_at:
+                await maintenance.start_global(
+                    session,
+                    message=window.banner_text,
+                    expected_end=window.ends_at,
+                    allow_ips=[],
+                    started_by=None,
+                )
+                window.status = "active"
+                session.add(
+                    MaintenanceHistory(
+                        created_at=now,
+                        user_id=None,
+                        source="scheduler",
+                        level="global",
+                        target=str(window.id),
+                        action="on",
+                        reason=window.banner_text,
+                    )
+                )
+                await session.commit()
+                log.info("Scheduled maintenance started (window %s)", window.id)
+
+            elif window.status == "active" and now >= window.ends_at:
+                current = await maintenance.get_state(force=True)
+                # Do not auto-disable if the owner manually extended it (§6).
+                expected = current.global_state.expected_end
+                if expected and expected > window.ends_at:
+                    continue
+                await maintenance.stop_global(session)
+                window.status = "completed"
+                session.add(
+                    MaintenanceHistory(
+                        created_at=now,
+                        user_id=None,
+                        source="scheduler",
+                        level="global",
+                        target=str(window.id),
+                        action="off",
+                        reason="scheduled end",
+                    )
+                )
+                await session.commit()
+                log.info("Scheduled maintenance ended (window %s)", window.id)
+
+            elif window.status == "scheduled" and now >= window.ends_at:
+                window.status = "completed"
+                await session.commit()
+
+
+async def reload_maintenance_state() -> None:
+    """Safety net: re-read durable state every 30s (§7, §11)."""
+    from app.core import maintenance
+
+    await maintenance.restore_redis_on_startup()

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from app.config import settings
+from app.core import metrics
 
 log = logging.getLogger(__name__)
 
@@ -18,11 +21,32 @@ class Base(DeclarativeBase):
     pass
 
 
+class InstrumentedPool(AsyncAdaptedQueuePool):
+    """QueuePool that records how long callers waited for a connection.
+
+    LOAD_FIX requirement 5/6: any remaining starvation must be visible as a
+    metric and a log line, not just felt as latency.
+    """
+
+    def _do_get(self):  # type: ignore[override]
+        started = time.perf_counter()
+        try:
+            return super()._do_get()
+        finally:
+            metrics.observe_pool_wait(time.perf_counter() - started)
+
+
+# The data plane never holds a connection across a provider call (see
+# app/core/execute.py), so the pool only ever needs to cover short bursts of
+# fast queries. A short checkout timeout makes any remaining starvation fail
+# loudly in seconds instead of turning into a 30-second latency outage.
 if settings.is_sqlite:
     engine = create_async_engine(
         settings.database_url,
         echo=False,
         pool_pre_ping=True,
+        poolclass=InstrumentedPool,
+        pool_timeout=settings.db_pool_timeout,
         connect_args={"timeout": 30},
     )
 else:
@@ -30,10 +54,37 @@ else:
         settings.database_url,
         echo=False,
         pool_pre_ping=True,
+        poolclass=InstrumentedPool,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
-        pool_recycle=1800,
+        pool_timeout=settings.db_pool_timeout,
+        pool_recycle=settings.db_pool_recycle,
     )
+
+
+def pool_stats() -> dict:
+    """Checked-out / idle / capacity counts, for /metrics and the overload gate."""
+    pool = engine.pool
+    stats: dict = {"pool_class": type(pool).__name__}
+    for name in ("size", "checkedin", "checkedout"):
+        fn = getattr(pool, name, None)
+        if fn is None:
+            continue
+        try:
+            stats[name] = int(fn())
+        except (TypeError, ValueError):  # pragma: no cover - pool without counts
+            continue
+
+    # pool.overflow() is NEGATIVE while base connections are still idle (it
+    # reports size - checkedout in that range), so it cannot be used as the
+    # overflow count. The true limit lives on the configured max.
+    max_overflow = getattr(pool, "_max_overflow", None)
+    stats["max_overflow"] = int(max_overflow) if isinstance(max_overflow, int) else 0
+    stats["overflow"] = max(0, stats.get("checkedout", 0) - stats.get("size", 0))
+
+    size = int(stats.get("size", 0))
+    stats["capacity"] = size + max(0, stats["max_overflow"]) if size else 0
+    return stats
 
 if settings.is_sqlite:
 

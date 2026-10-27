@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -105,6 +106,138 @@ async def provider_spend(session: AsyncSession, provider_id: int) -> float:
     return float(result.scalar() or 0.0)
 
 
+# ------------------------------------------------------- cached spend checks
+# Spend caps are decided with aggregates over the request log. Running one per
+# request is exactly the hot-path database work LOAD_FIX asks to remove, and at
+# high concurrency a slow aggregate is what keeps a connection checked out. The
+# results are therefore cached for a couple of seconds.
+#
+# The trade-off: a partner can exceed a cap by up to `spend_cache_ttl` seconds of
+# traffic. That is acceptable for a monthly budget and is bounded by the global
+# in-flight cap; it is not acceptable for a hard per-request limit, which is
+# what the Redis/DB counters are still used for.
+_spend_cache: dict[tuple[str, int], tuple[float, float]] = {}
+# Single-flight locks, keyed by loop as well as subject: an asyncio.Lock binds
+# to the loop that first contends for it, and this process can run several.
+_spend_locks: dict[tuple[int, str, int], asyncio.Lock] = {}
+# A stale value is only served this far past its TTL, and only when a refresh
+# fails. Kept close to the TTL so a spend cap cannot be silently bypassed for
+# long; a failed refresh is logged either way.
+_SPEND_STALE_HARD_LIMIT = 15.0
+
+
+def _spend_ttl() -> float:
+    return float(settings.spend_cache_ttl)
+
+
+def _cached(kind: str, obj_id: int) -> float | None:
+    entry = _spend_cache.get((kind, obj_id))
+    if not entry:
+        return None
+    value, at = entry
+    if time.monotonic() - at >= _spend_ttl():
+        return None
+    return value
+
+
+def _stale_ok(kind: str, obj_id: int) -> float | None:
+    entry = _spend_cache.get((kind, obj_id))
+    if not entry:
+        return None
+    value, at = entry
+    if time.monotonic() - at < _SPEND_STALE_HARD_LIMIT:
+        return value
+    return None
+
+
+def _remember(kind: str, obj_id: int, value: float) -> float:
+    _spend_cache[(kind, obj_id)] = (value, time.monotonic())
+    return value
+
+
+def invalidate_spend() -> None:
+    """Throw the spend cache away (admin writes, tests)."""
+    _spend_cache.clear()
+
+
+async def _resolve(kind: str, obj_id: int, fetch) -> float:
+    """Single-flight cache read: one aggregate at a time per subject.
+
+    Without this, every request in a concurrent burst misses on the same
+    expired entry and runs the same table scan at once - a cache stampede that
+    holds the whole pool. With it, the first caller computes and the rest share
+    the result.
+
+    ``fetch`` opens its own short session. That matters: callers must not hold
+    a connection while they wait on this lock, or a burst would park a hundred
+    checked-out connections behind one aggregate and exhaust the pool - the
+    exact failure this fix exists to prevent.
+    """
+    hit = _cached(kind, obj_id)
+    if hit is not None:
+        return hit
+
+    lock_key = (id(asyncio.get_running_loop()), kind, obj_id)
+    lock = _spend_locks.get(lock_key)
+    if lock is None:
+        lock = _spend_locks[lock_key] = asyncio.Lock()
+
+    async with lock:
+        # Another caller may have refreshed it while we waited.
+        hit = _cached(kind, obj_id)
+        if hit is not None:
+            return hit
+        try:
+            return _remember(kind, obj_id, await fetch())
+        except Exception:
+            stale = _stale_ok(kind, obj_id)
+            if stale is not None:
+                log.warning(
+                    "Spend refresh failed; serving the last known %s spend", kind,
+                    exc_info=True,
+                )
+                return stale
+            raise
+
+
+async def cached_key_cost(key_id: int) -> float:
+    async def fetch() -> float:
+        async with _own_session() as session:
+            return (await key_usage(session, key_id)).cost_this_month
+
+    return await _resolve("key", key_id, fetch)
+
+
+async def cached_partner_cost(partner_id: int) -> float:
+    async def fetch() -> float:
+        async with _own_session() as session:
+            return (await partner_usage(session, partner_id)).cost_this_month
+
+    return await _resolve("partner", partner_id, fetch)
+
+
+async def cached_provider_spend(provider_id: int) -> float:
+    async def fetch() -> float:
+        async with _own_session() as session:
+            return await provider_spend(session, provider_id)
+
+    return await _resolve("provider", provider_id, fetch)
+
+
+async def cached_global_spend() -> float:
+    async def fetch() -> float:
+        async with _own_session() as session:
+            return await global_spend(session)
+
+    return await _resolve("global", 0, fetch)
+
+
+def _own_session():
+    from app.db import SessionLocal
+
+    return SessionLocal()
+
+
 async def global_spend(session: AsyncSession) -> float:
     result = await session.execute(
         select(func.coalesce(func.sum(RequestLog.cost_usd), 0.0)).where(
@@ -123,9 +256,29 @@ async def paid_routes_blocked(session: AsyncSession, cap: float | None = None) -
 
 
 # --------------------------------------------------------------- checking
+# Daily limits are counted in the shared store rather than by COUNT(*) on the
+# request log. The key includes the UTC date so the window aligns with the
+# calendar day instead of drifting from first use, and so it resets at midnight
+# like `Retry-After` promises. Two consequences of the store being the counter:
+#   * without Redis the counter is per instance and is lost on restart, so the
+#     enforced daily total can exceed the configured limit;
+#   * a restart forgives the day's count.
+# Both are covered in LOAD_FIX_REPORT §6, which lists what degrades without
+# Redis.
+def _day_key(kind: str, obj_id: int) -> str:
+    return f"daily:{kind}:{obj_id}:{day_start().date().isoformat()}"
+
+
 async def check_rate_and_daily(
-    session: AsyncSession, partner: Partner, key: GatewayKey
+    session: AsyncSession | None, partner, key
 ) -> None:
+    """Rate, daily and spend checks.
+
+    ``partner`` and ``key`` are snapshots from app.core.config_cache, not ORM
+    rows, so this never needs a live session for the rate limits. The daily and
+    spend checks fall back to the database only when a limit is actually
+    configured; both are cached counters in Redis when Redis is present.
+    """
     store = get_store()
 
     partner_rpm = partner.rpm_limit
@@ -151,16 +304,16 @@ async def check_rate_and_daily(
     # Each limit is checked against the traffic it actually governs: a key's
     # daily limit must not be consumed by a sibling key's requests.
     if partner.daily_request_limit is not None:
-        usage = await partner_usage(session, partner.id)
-        if usage.requests_today >= partner.daily_request_limit:
+        used = await store.incr_window(_day_key("partner", partner.id), 86400)
+        if used > partner.daily_request_limit:
             raise LimitExceeded(
                 "daily_limit_reached",
                 f"Partner daily limit of {partner.daily_request_limit} requests reached.",
                 retry_after=_seconds_until_tomorrow(),
             )
     if key.daily_limit is not None:
-        key_use = await key_usage(session, key.id)
-        if key_use.requests_today >= key.daily_limit:
+        used = await store.incr_window(_day_key("key", key.id), 86400)
+        if used > key.daily_limit:
             raise LimitExceeded(
                 "daily_limit_reached",
                 f"Daily limit of {key.daily_limit} requests reached for this key.",
@@ -168,18 +321,21 @@ async def check_rate_and_daily(
             )
 
     # A cap of 0 means "no spend allowed at all", so test for None explicitly.
+    # Spend needs an aggregate over the request log. The cached helpers open
+    # their own short session rather than borrowing the caller's, so a caller
+    # waiting on the single-flight lock is not also holding a connection.
     cap = _tightest_float(key.monthly_cap_usd, partner.monthly_cap_usd)
-    if cap is not None:
+    if cap is not None and session is not None:
         if key.monthly_cap_usd is not None:
-            key_use = await key_usage(session, key.id)
-            if key_use.cost_this_month >= key.monthly_cap_usd:
+            key_cost = await cached_key_cost(key.id)
+            if key_cost >= key.monthly_cap_usd:
                 raise LimitExceeded(
                     "spend_cap_reached",
                     f"Key spend cap of ${key.monthly_cap_usd:.2f} reached this month.",
                 )
         if partner.monthly_cap_usd is not None:
-            partner_use = await partner_usage(session, partner.id)
-            if partner_use.cost_this_month >= partner.monthly_cap_usd:
+            partner_cost = await cached_partner_cost(partner.id)
+            if partner_cost >= partner.monthly_cap_usd:
                 raise LimitExceeded(
                     "spend_cap_reached",
                     f"Partner spend cap of ${partner.monthly_cap_usd:.2f} reached this month.",
@@ -223,17 +379,22 @@ def _tightest_float(*values: float | None) -> float | None:
 
 # ------------------------------------------------------------ concurrency
 @asynccontextmanager
-async def concurrency_slot(partner: Partner, key: GatewayKey):
+async def concurrency_slot(partner: Partner, key: GatewayKey, reduce_pct: int = 0):
     """Reserve an in-flight slot for the partner and the key.
 
     Slots always carry a TTL, so a crashed instance cannot leak capacity.
     The slot is released in a finally block, on errors and disconnects alike.
+
+    reduce_pct is the degraded-mode reduction (MAINTENANCE_SPEC §4.2): the
+    effective cap is scaled down, never below 1.
     """
     store = get_store()
     ttl = settings.concurrency_slot_ttl
     acquired: list[str] = []
 
     partner_limit = _tightest(partner.concurrency_limit, key.concurrency_limit)
+    if partner_limit and reduce_pct:
+        partner_limit = max(1, int(partner_limit * (100 - reduce_pct) / 100))
     if partner_limit:
         scope = f"partner:{partner.id}"
         ok = await store.acquire_slot(scope, partner_limit, ttl)

@@ -44,6 +44,10 @@ def serialize(partner: Partner, key_count: int | None = None) -> dict:
         "markup_multiplier": partner.markup_multiplier,
         "allow_free_tier": partner.allow_free_tier,
         "is_active": partner.is_active,
+        # Maintenance suspension (MAINTENANCE_SPEC §4.3).
+        "suspended": partner.suspended,
+        "suspended_reason_public": partner.suspended_reason_public,
+        "suspended_at": iso(partner.suspended_at),
         "notes": partner.notes,
         "key_count": key_count,
         "created_at": iso(partner.created_at),

@@ -4,36 +4,51 @@ Order (brief §5.1): auth -> limits -> concurrency -> cache -> route -> fallback
 -> cost/price -> log. Both `/v1/chat/completions` and the Playground call
 `execute_chat`, so what you test in the console is what your apps get.
 
-Two things are deliberate:
-* Logging happens in a background task, so it never adds latency to the reply.
-* Provider keys are decrypted per call and never leave this module.
+Connection discipline (LOAD_FIX): no database connection is held across a
+provider HTTP call. The pipeline is
+
+    1. short session  -> limits, spend caps, cache lookup, candidate routing
+       (the connection returns to the pool here)
+    2. provider calls -> no connection checked out anywhere
+    3. short session  -> cache write, then the request log in a background task
+
+Auth runs in `app.api.deps` on its own short session before this function is
+called. ``key`` and ``partner`` are detached snapshots from
+app.core.config_cache, so nothing here needs a live session to identify the
+caller.
+
+Provider health bookkeeping also happens off the hot path: it is queued with the
+log row and written by the same background task.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from app.config import settings
 from app.core import cache as response_cache
-from app.core import health, limits, metrics, settings_store
+from app.core import config_cache, health, limits, metrics, settings_store
 from app.core.cost import compute_cost, compute_price
 from app.core.crypto import decrypt
 from app.core.router import Candidate, NoCandidate, extract_features, pick_candidates
-from app.models import GatewayKey, Partner, RequestLog
+from app.db import SessionLocal
+from app.models import GatewayKey, Provider, RequestLog
 from app.providers import openai_compat
 from app.providers.base import (
     BadRequest,
     EmptyResponse,
     ProviderAuthError,
-    ProviderCall,
     ProviderError,
+    ProviderCall,
 )
 from app.utils import estimate_tokens, new_request_id, utcnow
 
@@ -97,6 +112,19 @@ class ChatResult:
     estimated_usage: bool = False
 
 
+@dataclass(slots=True)
+class ProviderHealth:
+    """Queued health bookkeeping, applied by the background writer."""
+
+    provider_id: int
+    ok: bool
+    error: str | None = None
+    auth_error: bool = False
+    rate_limited: bool = False
+    latency_ms: int | None = None
+    health: str = "healthy"
+
+
 # --------------------------------------------------------------- helpers
 def _upstream_body(body: dict[str, Any], model_name: str) -> dict[str, Any]:
     payload = {k: v for k, v in body.items() if k not in _GATEWAY_FIELDS}
@@ -137,8 +165,8 @@ def _payload_for_log(
 def _build_log_row(
     *,
     request_id: str,
-    key: GatewayKey | None,
-    partner: Partner | None,
+    key: GatewayKey | Any | None,
+    partner: Any | None,
     end_user: str | None,
     requested_model: str,
     provider_id: int | None,
@@ -179,66 +207,215 @@ def _build_log_row(
     )
 
 
-async def _commit_log(
-    row: RequestLog, key_id: int | None, request_id: str
+async def _write_log(
+    row: RequestLog,
+    key_id: int | None,
+    health_updates: list[ProviderHealth],
+    request_id: str,
 ) -> None:
-    """Commit the log row on a fresh session.
+    """Queue the post-flight work for the batch writer.
 
-    Runs as a background task, so it never delays the response, and it never
-    touches the request-scoped session (which FastAPI closes as soon as the
-    response is sent).
+    LOAD_FIX requirement 3: request-log writes must not be able to starve the
+    pool. One task per request is not enough on SQLite, where a single writer
+    lock makes N tasks hold N connections while they block behind each other.
+    Instead every request appends to an in-process queue and one writer task
+    drains it in batches, so concurrent logging costs at most one connection.
     """
-    from app.db import SessionLocal
-
-    try:
-        async with SessionLocal() as session:
-            session.add(row)
-            if key_id is not None:
-                key = await session.get(GatewayKey, key_id)
-                if key is not None:
-                    key.last_used_at = row.created_at
-            await session.commit()
-    except Exception:  # pragma: no cover - logging must never break a response
-        log.exception("Failed to write request log", extra={"request_id": request_id})
+    enqueue(row, key_id, health_updates, request_id)
 
 
-async def _note_provider(
-    session: AsyncSession, candidate: Candidate, exc: ProviderError
+LOG_BATCH_SIZE = 100
+
+# An asyncio.Queue binds to the loop that first uses it, and this process can
+# run more than one loop (the test server thread, asyncio.run, the CLI). Both
+# the queue and its writer are therefore kept per loop, keyed by the loop
+# object itself: keying by id() alone is unsafe because CPython reuses ids once
+# a loop is collected, and a new loop would inherit a queue bound to a dead one.
+#
+# A WeakKeyDictionary is NOT enough here: the queue and the writer task each
+# hold a strong reference back to their loop, so the key can never die and the
+# entry would leak one slot per loop. Entries are therefore held explicitly,
+# guarded by a weak reference (so a reused id is detected), and pruned as soon
+# as their loop is closed. One entry per live loop, bounded.
+_loop_state: dict[int, list] = {}
+
+
+def _prune_closed_loops() -> None:
+    for key, (ref, _queue_obj, _task) in list(_loop_state.items()):
+        loop = ref()
+        if loop is None or loop.is_closed():
+            _loop_state.pop(key, None)
+
+
+def _state() -> list:
+    """[weakref, queue, writer_task] for the running loop, created on demand."""
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+
+    entry = _loop_state.get(key)
+    if entry is not None:
+        if entry[0]() is loop:
+            return entry
+        # The id was reused by a different loop: the old entry is stale.
+        _loop_state.pop(key, None)
+
+    _prune_closed_loops()
+    entry = [weakref.ref(loop), asyncio.Queue(), None]
+    _loop_state[key] = entry
+    return entry
+
+
+def _queue() -> asyncio.Queue:
+    return _state()[1]
+
+
+def _ensure_writer() -> None:
+    entry = _state()
+    task = entry[2]
+    if task is None or task.done():
+        entry[2] = asyncio.get_running_loop().create_task(_log_writer(entry[1]))
+
+
+def enqueue(
+    row: RequestLog,
+    key_id: int | None,
+    health_updates: list[ProviderHealth],
+    request_id: str = "",
 ) -> None:
-    provider = candidate.provider
-    provider.last_checked_at = utcnow()
-    provider.last_error = f"{exc.code}: {exc.message}"[:500]
-    if isinstance(exc, ProviderAuthError):
-        provider.health_status = "misconfigured"
-    elif exc.status == 429:
-        provider.health_status = "rate_limited"
-    else:
-        provider.health_status = "degraded"
+    """Hand one finished request to the batch writer. Never blocks, never I/O."""
+    if not settings.log_writer_enabled:  # pragma: no cover - diagnostics only
+        return
+    _queue().put_nowait((row, key_id, health_updates))
+    _ensure_writer()
+
+
+async def _log_writer(queue: asyncio.Queue) -> None:
+    """Drain the log queue in batches, on one short session per batch."""
+    while True:
+        try:
+            first = await queue.get()
+        except asyncio.CancelledError:  # pragma: no cover - shutdown
+            return
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Log queue reader failed; retrying")
+            await asyncio.sleep(1)
+            continue
+
+        batch = [first]
+        # Take whatever else is already queued, up to the batch limit.
+        while len(batch) < LOG_BATCH_SIZE:
+            try:
+                batch.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        try:
+            await _flush(batch)
+        except Exception:  # pragma: no cover - logging must never break a response
+            log.exception(
+                "Failed to write request log batch of %d", len(batch),
+                extra={"request_id": batch[0][0].request_id},
+            )
+        finally:
+            for _ in batch:
+                queue.task_done()
+
+
+async def _flush(batch: list[tuple[RequestLog, int | None, list[ProviderHealth]]]) -> None:
+    """Write a batch of log rows and de-duplicated health updates.
+
+    A single bad row (for example one whose key was deleted mid-flight) would
+    otherwise take the whole batch down, so a failed batch is retried row by
+    row before anything is dropped.
+    """
     try:
+        await _flush_rows(batch)
+        return
+    except Exception:
+        if len(batch) == 1:
+            raise
+        log.warning(
+            "Batch of %d log rows failed; retrying individually", len(batch),
+            exc_info=True,
+        )
+
+    for item in batch:
+        try:
+            await _flush_rows([item])
+        except Exception:  # pragma: no cover - one poison row
+            log.exception(
+                "Dropping one request log row",
+                extra={"request_id": item[0].request_id},
+            )
+
+
+async def _flush_rows(
+    batch: list[tuple[RequestLog, int | None, list[ProviderHealth]]]
+) -> None:
+    rows = [row for row, _, _ in batch]
+    key_ids = {key_id for _, key_id, _ in batch if key_id is not None}
+
+    # Collapse health updates: only the last word per provider matters.
+    health: dict[int, ProviderHealth] = {}
+    for _, _, updates in batch:
+        for update in updates:
+            health[update.provider_id] = update
+
+    async with SessionLocal() as session:
+        session.add_all(rows)
+        for key_id in key_ids:
+            key = await session.get(GatewayKey, key_id)
+            if key is not None:
+                key.last_used_at = utcnow()
+        for provider_id, update in health.items():
+            provider = await session.get(Provider, provider_id)
+            if provider is None:
+                continue
+            provider.last_checked_at = utcnow()
+            provider.health_status = update.health
+            provider.last_error = update.error[:500] if update.error else None
+            if update.ok and update.latency_ms is not None:
+                provider.last_latency_ms = update.latency_ms
         await session.commit()
-    except Exception:  # pragma: no cover
-        await session.rollback()
+
+
+async def drain_log_queue(timeout: float = 10.0) -> None:
+    """Wait for queued log rows to be written (shutdown and tests)."""
+    try:
+        await asyncio.wait_for(_queue().join(), timeout=timeout)
+    except (asyncio.TimeoutError, RuntimeError):  # pragma: no cover - shutdown only
+        log.warning("Log queue did not drain within %.0fs", timeout)
 
 
 # ---------------------------------------------------------------- execute
 async def execute_chat(
-    session: AsyncSession,
     *,
-    key: GatewayKey,
-    partner: Partner,
+    key,
+    partner,
     body: dict[str, Any],
     client: httpx.AsyncClient,
     source: str = "api",
     end_user: str | None = None,
-    background: Any = None,
 ) -> ChatResult:
+    """Run one chat request.
+
+    ``key`` and ``partner`` are snapshots from app.core.config_cache, not ORM
+    rows, so this function needs no live session or request state at all. Every
+    database touch below opens its own short session and releases it before any
+    network call.
+    """
     request_id = new_request_id()
     started = time.perf_counter()
     requested_model = str(body.get("model") or "auto")
-    log_mode = str(settings_store.get("log_prompts", settings.log_prompts))
+
+    health_updates: list[ProviderHealth] = []
 
     def finish_log(**kwargs) -> None:
-        """Queue the log row so it is written after the response is sent."""
+        """Hand the log row to the batch writer, after the response is sent.
+
+        Enqueueing is non-blocking and opens no connection, so a logging
+        backlog can never consume the pool.
+        """
         row = _build_log_row(
             request_id=request_id,
             key=key,
@@ -248,19 +425,47 @@ async def execute_chat(
             body=body,
             **kwargs,
         )
-        key_id = key.id if key else None
-        if background is not None:
-            background.add_task(_commit_log, row, key_id, request_id)
-        else:
-            # No background runner (direct calls from tests): schedule it.
-            import asyncio
+        enqueue(row, key.id if key else None, list(health_updates), request_id)
 
-            asyncio.get_event_loop().create_task(_commit_log(row, key_id, request_id))
+    # ---- 0. degraded mode restrictions (MAINTENANCE_SPEC §4.2) --------
+    from app.core import maintenance as maint
+
+    snapshot = await maint.get_state()
+    degraded = snapshot.degraded
+    if degraded.active and degraded.max_tokens:
+        requested = body.get("max_tokens")
+        if requested and int(requested) > degraded.max_tokens:
+            finish_log(
+                provider_id=None,
+                model_id=None,
+                status=429,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                prompt_tokens=0,
+                completion_tokens=0,
+                cost=0.0,
+                price=0.0,
+                cached=False,
+                attempts=[],
+                response=None,
+                error="degraded_mode: max_tokens exceeded",
+                source=source,
+            )
+            raise ChatError(
+                429,
+                "degraded_mode",
+                f"The service is running with reduced limits: max_tokens is capped at "
+                f"{degraded.max_tokens}. Please retry with a smaller value.",
+                request_id=request_id,
+                retry_after=60,
+            )
 
     try:
-        # ---- 1-2. rate + daily + spend ---------------------------------
+        # ---- 1-3. limits: rate, daily, spend, concurrency -----------------
+        # One short session covers the spend aggregates; it is released before
+        # anything is sent upstream.
         try:
-            await limits.check_rate_and_daily(session, partner, key)
+            async with SessionLocal() as session:
+                await limits.check_rate_and_daily(session, partner, key)
         except limits.LimitExceeded as exc:
             metrics.record_request(partner.slug, "429", 0)
             finish_log(
@@ -282,9 +487,10 @@ async def execute_chat(
                 429, exc.code, exc.message, request_id=request_id, retry_after=exc.retry_after
             ) from exc
 
-        # ---- 3. concurrency --------------------------------------------
         try:
-            slot = limits.concurrency_slot(partner, key)
+            slot = limits.concurrency_slot(
+                partner, key, reduce_pct=degraded.reduce_concurrency_pct if degraded.active else 0
+            )
             await slot.__aenter__()
         except limits.LimitExceeded as exc:
             metrics.record_request(partner.slug, "429", 0)
@@ -307,9 +513,9 @@ async def execute_chat(
                 429, exc.code, exc.message, request_id=request_id, retry_after=exc.retry_after
             ) from exc
 
+        maint.track_start()
         try:
             return await _run(
-                session,
                 key=key,
                 partner=partner,
                 body=body,
@@ -320,22 +526,48 @@ async def execute_chat(
                 source=source,
                 end_user=end_user,
                 finish_log=finish_log,
-                log_mode=log_mode,
+                health_updates=health_updates,
             )
         finally:
+            maint.track_end()
             await slot.__aexit__(None, None, None)
     except ChatError:
         raise
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, SQLAlchemyTimeoutError):
+            # A pool checkout timeout is a capacity signal, not a bug: fail
+            # fast with a retryable status instead of a generic 500, and let the
+            # error handler log the pool state (LOAD_FIX requirement 5).
+            metrics.refresh_pool_gauges()
+            log.error(
+                "DB pool exhausted during a chat request [%s]; pool=%s",
+                request_id,
+                _pool_snapshot(),
+            )
+            raise ChatError(
+                503,
+                "database_busy",
+                "The gateway is busy. Please retry shortly.",
+                request_id=request_id,
+                retry_after=1,
+            ) from exc
         log.exception("Unexpected failure in the chat pipeline", extra={"request_id": request_id})
         raise ChatError(500, "internal_error", "Unexpected server error.", request_id=request_id)
 
 
+def _pool_snapshot() -> dict:
+    try:
+        from app.db import pool_stats
+
+        return pool_stats()
+    except Exception:  # pragma: no cover
+        return {}
+
+
 async def _run(
-    session: AsyncSession,
     *,
-    key: GatewayKey,
-    partner: Partner,
+    key,
+    partner,
     body: dict[str, Any],
     client: httpx.AsyncClient,
     request_id: str,
@@ -344,7 +576,42 @@ async def _run(
     source: str,
     end_user: str | None,
     finish_log,
-    log_mode: str,
+    health_updates: list[ProviderHealth],
+) -> ChatResult:
+    # ---- 4-6. pre-flight ------------------------------------------------
+    # Cache lookup, the spend aggregates behind the caps, and the spend figures
+    # routing needs are all "is this request allowed to run" questions. Each
+    # opens a short session and releases it immediately; none is held while a
+    # request waits on a lock or a network call (LOAD_FIX requirement 1/2).
+    estimated_tokens = estimate_tokens(json.dumps(body.get("messages") or []))
+    return await _preflight_and_run(
+        key=key,
+        partner=partner,
+        body=body,
+        client=client,
+        request_id=request_id,
+        requested_model=requested_model,
+        started=started,
+        source=source,
+        finish_log=finish_log,
+        health_updates=health_updates,
+        estimated_tokens=estimated_tokens,
+    )
+
+
+async def _preflight_and_run(
+    *,
+    key,
+    partner,
+    body: dict[str, Any],
+    client: httpx.AsyncClient,
+    request_id: str,
+    requested_model: str,
+    started: float,
+    source: str,
+    finish_log,
+    health_updates: list[ProviderHealth],
+    estimated_tokens: int,
 ) -> ChatResult:
     # ---- 4. cache -------------------------------------------------------
     ttl = int(settings_store.get("cache_ttl_seconds", 3600) or 0)
@@ -363,7 +630,8 @@ async def _run(
                 "preset": body.get("preset"),
             },
         )
-        cached_body = await response_cache.get(session, cache_key, ttl)
+        async with SessionLocal() as session:
+            cached_body = await response_cache.get(session, cache_key, ttl)
         if cached_body:
             latency_ms = int((time.perf_counter() - started) * 1000)
             usage = cached_body.get("usage") or {}
@@ -434,10 +702,12 @@ async def _run(
         ) from exc
 
     # ---- 6. candidates ---------------------------------------------------
+    # Routing opens and closes its own short sessions. Nothing is held across
+    # the provider loop below (LOAD_FIX requirement 1).
     features = extract_features(body, body.get("preset"))
     try:
         candidates = await pick_candidates(
-            session, requested_model, key, features, partner=partner
+            requested_model, key, features, partner=partner
         )
     except NoCandidate as exc:
         metrics.record_request(partner.slug, "503", 0)
@@ -505,8 +775,17 @@ async def _run(
                 )
             )
             await health.record_failure(candidate.provider.id, exc.retry_after)
-            await _note_provider(session, candidate, exc)
             metrics.record_provider_failure(candidate.provider.name)
+            health_updates.append(
+                ProviderHealth(
+                    provider_id=candidate.provider.id,
+                    ok=False,
+                    error=f"{exc.code}: {exc.message}",
+                    auth_error=isinstance(exc, ProviderAuthError),
+                    rate_limited=exc.status == 429,
+                    health=_failure_health(exc),
+                )
+            )
 
             if isinstance(exc, BadRequest):
                 # The request itself is likely wrong: retry once elsewhere, then stop.
@@ -543,22 +822,38 @@ async def _run(
             "request_id": request_id,
         }
 
+        health_updates.append(
+            ProviderHealth(
+                provider_id=candidate.provider.id,
+                ok=True,
+                latency_ms=result.latency_ms,
+                health="healthy",
+            )
+        )
+
+        # The cache entry is observable to the next request, so it is written now
+        # rather than in the background. This opens its own short session: the
+        # pre-flight one was released before the provider call. Best-effort: a
+        # cache failure must never turn a successful answer into an error.
         if cache_key:
             # Attribution travels with the entry so a cache hit still logs the origin.
-            await response_cache.put(
-                session,
-                cache_key,
-                {
-                    **response_body,
-                    "_provider_id": candidate.provider.id,
-                    "_model_id": candidate.model.id,
-                },
-            )
-
-        candidate.provider.health_status = "healthy"
-        candidate.provider.last_error = None
-        candidate.provider.last_latency_ms = result.latency_ms
-        candidate.provider.last_checked_at = utcnow()
+            try:
+                async with SessionLocal() as cache_session:
+                    await response_cache.put(
+                        cache_session,
+                        cache_key,
+                        {
+                            **response_body,
+                            "_provider_id": candidate.provider.id,
+                            "_model_id": candidate.model.id,
+                        },
+                    )
+            except Exception:  # pragma: no cover - caching is optional
+                log.warning(
+                    "Cache write failed; serving the response uncached",
+                    extra={"request_id": request_id},
+                    exc_info=True,
+                )
 
         finish_log(
             provider_id=candidate.provider.id,
@@ -626,3 +921,11 @@ async def _run(
         request_id=request_id,
         attempts=[a.as_dict() for a in attempts],
     )
+
+
+def _failure_health(exc: ProviderError) -> str:
+    if isinstance(exc, ProviderAuthError):
+        return "misconfigured"
+    if exc.status == 429:
+        return "rate_limited"
+    return "degraded"

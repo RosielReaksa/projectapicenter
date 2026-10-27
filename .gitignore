@@ -9,6 +9,8 @@ data/
 
 # Python
 .venv/
+.venv_*/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/

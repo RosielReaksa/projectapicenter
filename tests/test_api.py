@@ -228,7 +228,12 @@ def test_max_tokens_is_clamped(gateway_url, provider_id, gateway_key):
 
 # ------------------------------------------------------------ concurrency
 def test_concurrency_cap_holds_under_load(gateway_url, admin_client, provider_id):
-    """Brief acceptance 6: never more than N in flight, and no leaked slots."""
+    """Brief acceptance 6: never more than N in flight, and no leaked slots.
+
+    Uses the 2s model so the requests genuinely overlap. With an instant
+    provider they would finish before the cap could ever be reached, and the
+    test would pass without exercising anything.
+    """
     partner = admin_client.post(
         "/admin/partners",
         json={
@@ -241,7 +246,7 @@ def test_concurrency_cap_holds_under_load(gateway_url, admin_client, provider_id
     raw = new_key(admin_client, partner["id"])
 
     def one(_):
-        return chat(gateway_url, raw, model="ok-model").status_code
+        return chat(gateway_url, raw, model="slow2-model").status_code
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         statuses = list(pool.map(one, range(8)))
@@ -469,3 +474,28 @@ def test_oversized_body_rejected(gateway_url, provider_id, gateway_key):
         timeout=60,
     )
     assert response.status_code == 413
+
+
+# ------------------------------------------------------------ routing preview
+def test_routing_preview_returns_candidates(admin_client, provider_id):
+    """The preview runs the real selection path without calling a provider."""
+    response = admin_client.post(
+        "/admin/routing/preview",
+        json={"model": "ok-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["candidates"], data
+    first = data["candidates"][0]
+    assert first["model"] == "ok-model"
+    assert first["provider"] == "custom"
+
+
+def test_routing_preview_reports_unknown_model(admin_client, provider_id):
+    response = admin_client.post(
+        "/admin/routing/preview", json={"model": "definitely-not-a-model"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["candidates"] == []
+    assert "Unknown model" in data["error"]

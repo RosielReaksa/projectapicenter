@@ -3,6 +3,7 @@
 Behaviour is chosen by the model name so one server can exercise every path:
   ok-model       200 with usage
   slow-model     sleeps then answers
+  slow2-model    sleeps exactly 2s (LOAD_FIX latency tests)
   fail-model     500
   ratelimit-model 429 with Retry-After
   bad-model      400
@@ -20,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 fake = FastAPI()
 CALLS: list[dict] = []
+ACTIVE = 0  # calls currently parked inside the handler, for LOAD_FIX tests
 
 
 def _body(model: str, text: str = "hello from fake") -> dict:
@@ -41,6 +43,7 @@ def _body(model: str, text: str = "hello from fake") -> dict:
 
 @fake.post("/v1/chat/completions")
 async def completions(request: Request):
+    global ACTIVE
     payload = await request.json()
     model = payload.get("model", "")
     CALLS.append({"model": model, "payload": payload, "auth": request.headers.get("authorization")})
@@ -60,6 +63,15 @@ async def completions(request: Request):
     if model == "slow-model":
         await asyncio.sleep(3)
         return JSONResponse(_body(model, "slow reply"))
+    if model in ("slow2-model", "park-model"):
+        # Used by the LOAD_FIX regressions: long enough that many requests are
+        # parked inside the provider call at the same time.
+        ACTIVE += 1
+        try:
+            await asyncio.sleep(2)
+        finally:
+            ACTIVE -= 1
+        return JSONResponse(_body(model, "slow2 reply"))
     if model == "no-usage-model":
         body = _body(model)
         body.pop("usage")
@@ -74,7 +86,7 @@ async def models():
 
 @fake.get("/__calls")
 async def calls():
-    return {"calls": CALLS}
+    return {"calls": CALLS, "active": ACTIVE}
 
 
 @fake.post("/__reset")

@@ -14,6 +14,7 @@ import PlaygroundPage from './pages/PlaygroundPage'
 import PartnersPage from './pages/PartnersPage'
 import SettingsPage from './pages/SettingsPage'
 import AccessRequestsPage from './pages/AccessRequestsPage'
+import MaintenancePage from './pages/MaintenancePage'
 import DocsPage from './pages/DocsPage'
 import HomePage from './pages/public/HomePage'
 import PublicModelsPage from './pages/public/PublicModelsPage'
@@ -103,6 +104,14 @@ export default function App() {
           element={
             <RequireOwner>
               <AccessRequestsPage />
+            </RequireOwner>
+          }
+        />
+        <Route
+          path="maintenance"
+          element={
+            <RequireOwner>
+              <MaintenancePage />
             </RequireOwner>
           }
         />

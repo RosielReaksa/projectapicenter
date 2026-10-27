@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
+
+
+def parse_str_list(raw: str | None) -> list[str]:
+    """Parse a JSON string-list column, tolerating nulls and junk.
+
+    Used for allowed_models and allowed_ips, which are stored as JSON text.
+    A malformed value yields an empty list rather than raising, so a bad row
+    can never widen access or crash a request.
+    """
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [str(v) for v in value] if isinstance(value, list) else []
 
 
 def utcnow() -> datetime:

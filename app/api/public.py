@@ -179,3 +179,13 @@ async def create_access_request(
     # The same message regardless of whether the email was already known, so the
     # form never reveals who has an account (§4.2).
     return {"ok": True, "message": "Thanks. We'll review your request and reply by email."}
+
+
+@router.get("/status")
+async def public_status(session: AsyncSession = Depends(get_session)):
+    """Public maintenance state. No internal detail, no provider names (§8)."""
+    from app.core import maintenance
+
+    status = await maintenance.public_status()
+    status["upcoming_window"] = await maintenance.upcoming_window(session)
+    return status

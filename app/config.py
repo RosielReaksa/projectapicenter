@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://gateway:gateway@localhost:5432/gateway"
     db_pool_size: int = 10
     db_max_overflow: int = 20
+    # A connection must be acquired fast. Waiting 30s for a pool slot turns a
+    # capacity problem into a latency outage, so fail in a couple of seconds
+    # and shed instead (LOAD_FIX: data-plane pool starvation).
+    db_pool_timeout: float = 3.0
+    db_pool_recycle: int = 1800
 
     # Shared state: rate counters, concurrency, circuit breakers, idempotency.
     # Empty = in-memory (single instance / tests only).
@@ -72,6 +77,24 @@ class Settings(BaseSettings):
     # so a crashed instance can never permanently hold capacity.
     concurrency_slot_ttl: int = 120
 
+    # --- overload shedding (LOAD_FIX) ------------------------------------
+    # Requests this instance will hold at once. Above this we shed with 429 +
+    # Retry-After instead of queueing behind a connection checkout.
+    max_in_flight: int = 100
+    # How long the hot-path config cache (providers, models, routing) is trusted.
+    config_cache_ttl: float = 10.0
+    # Gateway-key lookups are cached separately and for less time, so a
+    # revoked key stops working quickly. Admin writes invalidate in-process
+    # at once; this bounds staleness across instances.
+    key_cache_ttl: float = 2.0
+    # Spend caps need an aggregate over the request log. Caching it keeps that
+    # query off the hot path; the cost is that a partner can overshoot a cap by
+    # up to this many seconds of traffic.
+    spend_cache_ttl: float = 5.0
+    # Request-log rows are written in batches by one background task, so
+    # logging costs at most one connection regardless of concurrency.
+    log_writer_enabled: bool = True
+
     # --- behaviour ------------------------------------------------------
     log_prompts: str = "metadata"        # off | metadata | full
     log_format: str = "json"             # json | text
@@ -79,6 +102,16 @@ class Settings(BaseSettings):
     idempotency_ttl_seconds: int = 86_400
     # Shared secret for /metrics. Empty = loopback only.
     metrics_token: str = ""
+
+    # --- maintenance (MAINTENANCE_SPEC §16) ------------------------------
+    maintenance_drain_timeout: int = 60      # seconds in-flight requests may finish
+    maintenance_retry_after: int = 300       # default Retry-After with no end time
+    maintenance_banner_lead_hours: int = 24  # show the public banner this far ahead
+    # When maintenance state cannot be read: refuse provider-cost requests
+    # ("closed") or let them through ("open").
+    maint_fail_mode: str = "closed"
+    # Scheduler lock TTL; one instance runs the window scheduler at a time.
+    maintenance_scheduler_lock_ttl: int = 60
 
     # --- first run ------------------------------------------------------
     admin_email: str = "admin@localhost"

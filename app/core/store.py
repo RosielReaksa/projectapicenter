@@ -48,6 +48,8 @@ class Store(Protocol):
 
     async def idem_store(self, key: str, value: dict, ttl: int) -> None: ...
 
+    async def idem_release(self, key: str) -> None: ...
+
     async def healthy(self) -> bool: ...
 
 
@@ -140,6 +142,10 @@ class MemoryStore:
 
     async def idem_store(self, key: str, value: dict, ttl: int) -> None:
         self._idem_values[key] = (dict(value), time.time() + ttl)
+
+    async def idem_release(self, key: str) -> None:
+        """Drop only the in-flight lock, keeping any stored response."""
+        self._idem_locks.pop(key, None)
 
 
 # ------------------------------------------------------------------- redis
@@ -236,6 +242,10 @@ class RedisStore:
 
     async def idem_store(self, key: str, value: dict, ttl: int) -> None:
         await self._client.set(self._k("idem", key), json.dumps(value), ex=ttl)
+        await self._client.delete(self._k("idem_lock", key))
+
+    async def idem_release(self, key: str) -> None:
+        """Drop only the in-flight lock, keeping any stored response."""
         await self._client.delete(self._k("idem_lock", key))
 
 

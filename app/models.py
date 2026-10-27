@@ -74,6 +74,14 @@ class Partner(Base):
     allow_free_tier: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text)
+
+    # Suspension (MAINTENANCE_SPEC §4.3). The internal reason is never shown
+    # to the partner; only reason_public leaves the building.
+    suspended: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    suspended_reason_internal: Mapped[str | None] = mapped_column(Text)
+    suspended_reason_public: Mapped[str | None] = mapped_column(Text)
+    suspended_at: Mapped[datetime | None] = mapped_column(DateTime)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
     keys: Mapped[list["GatewayKey"]] = relationship(back_populates="partner")
@@ -96,6 +104,11 @@ class Provider(Base):
     rpm_limit: Mapped[int | None] = mapped_column(Integer)
     priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # Manual maintenance pause (MAINTENANCE_SPEC §3.3). Distinct from the
+    # circuit breaker: a pause is deliberate and stays until the owner lifts it.
+    paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    paused_reason: Mapped[str | None] = mapped_column(Text)
 
     health_status: Mapped[str] = mapped_column(String(16), default="unknown", nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -303,3 +316,59 @@ class DailySummary(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     price_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+
+
+class MaintenanceState(Base):
+    """Single-row durable copy of the maintenance switches (§3.3).
+
+    Redis is the live source of truth read per request; this table survives
+    restarts and is what an instance loads from when Redis is empty.
+    """
+
+    __tablename__ = "maintenance_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    global_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    global_message: Mapped[str | None] = mapped_column(Text)
+    global_started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    global_expected_end: Mapped[datetime | None] = mapped_column(DateTime)
+    global_allow_ips: Mapped[str | None] = mapped_column(Text)  # JSON list
+    global_started_by: Mapped[int | None] = mapped_column(Integer)
+
+    degraded_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    degraded_config: Mapped[str | None] = mapped_column(Text)  # JSON
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class MaintenanceWindow(Base):
+    """A scheduled maintenance window (§6)."""
+
+    __tablename__ = "maintenance_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    starts_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    banner_text: Mapped[str] = mapped_column(Text, nullable=False)
+    auto_enable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="scheduled", nullable=False)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class MaintenanceHistory(Base):
+    """Who changed what, when and why (§3.3). Mirrored into audit_log."""
+
+    __tablename__ = "maintenance_history"
+    __table_args__ = (Index("idx_maint_history_time", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    source: Mapped[str] = mapped_column(String(16), nullable=False)  # dashboard|cli|scheduler
+    level: Mapped[str] = mapped_column(String(16), nullable=False)   # provider|degraded|partner|global
+    target: Mapped[str | None] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(32), nullable=False)  # on|off|schedule|cancel
+    reason: Mapped[str | None] = mapped_column(Text)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import secrets
 import time
 from dataclasses import dataclass
@@ -18,7 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.models import GatewayKey, Partner
-from app.utils import utcnow
+from app.utils import parse_str_list, utcnow
 
 KEY_PREFIX = "sk-gw-"
 _ph = PasswordHasher()
@@ -54,19 +53,14 @@ def gateway_key_prefix(raw: str) -> str:
 
 
 def _allowed_list(raw: str | None) -> list[str]:
-    if not raw:
-        return []
-    try:
-        value = json.loads(raw)
-        return [str(v) for v in value] if isinstance(value, list) else []
-    except json.JSONDecodeError:
-        return []
+    return parse_str_list(raw)
 
 
 @dataclass(slots=True)
 class KeyContext:
     key: GatewayKey
     partner: Partner
+    raw_key: str = ""
 
 
 class AuthError(Exception):
@@ -80,6 +74,11 @@ class AuthError(Exception):
 async def authenticate_gateway_key(
     session: AsyncSession, raw_key: str, client_ip: str | None
 ) -> KeyContext:
+    """Load a key and its partner from the database.
+
+    Still used wherever a live ORM row is wanted; the data plane authenticates
+    from app.core.config_cache instead, so it never needs a session here.
+    """
     if not raw_key or not raw_key.startswith(KEY_PREFIX):
         raise AuthError(401, "invalid_api_key", "Missing or malformed API key.")
 
@@ -92,22 +91,45 @@ async def authenticate_gateway_key(
     if not key:
         raise AuthError(401, "invalid_api_key", "API key not recognised.")
 
+    partner = key.partner
+    if partner is None:
+        raise AuthError(403, "partner_disabled", "The partner owning this key is inactive.")
+
+    check_key_policy(key, partner, client_ip)
+    return KeyContext(key=key, partner=partner, raw_key=raw_key)
+
+
+def check_key_policy(key, partner, client_ip: str | None) -> None:
+    """Every rule that decides whether a key may be used right now.
+
+    Kept in one place and expressed against the fields only, so it works the
+    same for a live ORM row and for the detached snapshots the data plane
+    caches (LOAD_FIX requirement 3).
+    """
     if not key.is_active:
         raise AuthError(403, "key_disabled", "This API key has been disabled.")
     if key.expires_at and key.expires_at < utcnow():
         raise AuthError(403, "key_expired", "This API key has expired.")
 
-    partner = key.partner
-    if partner is None or not partner.is_active:
+    if not partner.is_active:
         raise AuthError(403, "partner_disabled", "The partner owning this key is inactive.")
+
+    # Suspension is checked here so in-flight work drains and new work is
+    # refused immediately (MAINTENANCE_SPEC §4.3). The internal reason is
+    # never included in the response.
+    if partner.suspended:
+        raise AuthError(
+            403,
+            "partner_suspended",
+            partner.suspended_reason_public
+            or "Access is temporarily suspended. Contact support.",
+        )
 
     allowed_ips = _allowed_list(key.allowed_ips)
     if allowed_ips and client_ip not in allowed_ips:
         raise AuthError(
             403, "ip_not_allowed", "Requests from this IP address are not allowed for this key."
         )
-
-    return KeyContext(key=key, partner=partner)
 
 
 # -------------------------------------------------------------- admin auth

@@ -15,6 +15,7 @@ const NAV = [
   { to: '/console/playground', label: 'Playground', icon: 'play' },
   { to: '/console/partners', label: 'Partners', owner: true, icon: 'users' },
   { to: '/console/access-requests', label: 'Access Requests', owner: true, icon: 'inbox', badge: 'pending' },
+  { to: '/console/maintenance', label: 'Maintenance', owner: true, icon: 'wrench', badge: 'maint' },
   { to: '/console/settings', label: 'Settings', owner: true, icon: 'settings' },
   { to: '/console/docs', label: 'Docs', icon: 'book' },
 ]
@@ -33,6 +34,7 @@ function Icon({ name }) {
     settings: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z',
     book: 'M4 19.5A2.5 2.5 0 0 1 6.5 17H20M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z',
     inbox: 'M22 12h-6l-2 3h-4l-2-3H2M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z',
+    wrench: 'M14.7 6.3a4 4 0 1 0 5 5L21 21l-3 0-9.3-9.3a4 4 0 0 1-5-5L6 9l3-3 5.7.3z',
     menu: 'M3 12h18M3 6h18M3 18h18',
     search: 'M21 21l-4.35-4.35M17 11a6 6 0 1 1-12 0 6 6 0 0 1 12 0z',
     sun: 'M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4',
@@ -78,6 +80,7 @@ export default function Layout() {
   const [health, setHealth] = useState(null)
   const [pendingCount, setPendingCount] = useState(0)
   const [legalReviewed, setLegalReviewed] = useState(true)
+  const [maintState, setMaintState] = useState({ state: 'normal' })
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -123,6 +126,12 @@ export default function Layout() {
         if (alive) setLegalReviewed(data.legal_reviewed !== false)
       })
       .catch(() => {})
+    api
+      .get('/public/status')
+      .then((data) => {
+        if (alive) setMaintState(data)
+      })
+      .catch(() => {})
     return () => {
       alive = false
     }
@@ -164,6 +173,14 @@ export default function Layout() {
                 <span className="ml-auto badge-warning mono text-[10px] h-4 px-1.5">
                   {pendingCount}
                 </span>
+              )}
+              {item.badge === 'maint' && maintState.state !== 'normal' && (
+                <span
+                  className={`ml-auto h-2 w-2 rounded-full ${
+                    maintState.state === 'maintenance' ? 'bg-danger' : 'bg-warning'
+                  }`}
+                  aria-label={maintState.state === 'maintenance' ? 'Maintenance active' : 'Degraded'}
+                />
               )}
             </NavLink>
           ))}
@@ -234,6 +251,27 @@ export default function Layout() {
         </header>
 
         <main className="flex-1 w-full max-w-[1200px] mx-auto p-4 sm:p-6 overflow-x-hidden">
+          {maintState.state !== 'normal' && (
+            <a
+              href="/console/maintenance"
+              className={`mb-4 card px-4 py-3 text-sm flex items-center gap-3 ${
+                maintState.state === 'maintenance' ? 'border-danger/50' : 'border-warning/40'
+              }`}
+            >
+              <span
+                className={`h-2 w-2 rounded-full shrink-0 ${
+                  maintState.state === 'maintenance' ? 'bg-danger' : 'bg-warning'
+                }`}
+                aria-hidden="true"
+              />
+              <span className="flex-1">
+                {maintState.state === 'maintenance'
+                  ? maintState.message || 'Maintenance is active: all API calls are blocked.'
+                  : 'Some services are running with restrictions.'}
+              </span>
+              <span className="text-xs text-muted">Review →</span>
+            </a>
+          )}
           {isOwner && !legalReviewed && (
             <div className="mb-4 card border-warning/40 px-4 py-3 text-sm flex items-start gap-3">
               <span className="text-warning shrink-0" aria-hidden="true">⚠</span>

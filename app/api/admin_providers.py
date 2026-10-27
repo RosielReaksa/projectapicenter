@@ -50,6 +50,9 @@ def _serialize(provider: Provider) -> dict:
         "rpm_limit": provider.rpm_limit,
         "priority": provider.priority,
         "is_active": provider.is_active,
+        # Manual maintenance pause (MAINTENANCE_SPEC §4.1), distinct from health.
+        "paused": provider.paused,
+        "paused_reason": provider.paused_reason,
         "health_status": provider.health_status,
         "last_error": provider.last_error,
         "last_checked_at": iso(provider.last_checked_at),
